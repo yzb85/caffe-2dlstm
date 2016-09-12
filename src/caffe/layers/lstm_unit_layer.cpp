@@ -13,10 +13,10 @@ inline Dtype sigmoid(Dtype x) {
   return 1. / (1. + exp(-x));
 }
 
-template <typename Dtype>
-inline Dtype tanh(Dtype x) {
-  return 2. * sigmoid(2. * x) - 1.;
-}
+//template <typename Dtype>
+//inline Dtype tanh(Dtype x) {
+//  return 2. * sigmoid(2. * x) - 1.;
+//}
 template <typename Dtype>
 inline Dtype dtanh(Dtype y) {
 	return 1.-y*y;
@@ -85,10 +85,13 @@ void LSTMUnitLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
 	this->blobs_.resize(4);//input-h, hx-h,hy-h,cell-gate
 	weight_groups = 4;//4 groups:  0 for net input, 1 for input gate, 2 for output gate, 3 for forget gate 
 	vector<int> weight_shape(4);
-	weight_shape[0] = bottom[0]->shape(1);	//bottom channels
-	weight_shape[1] = weight_groups;
+	weight_shape[0] = hidden_dim_;	//hidden neuron number
+	weight_shape[1] = bottom[0]->shape(1);	//bottom channels
 	weight_shape[2] = kernel_height_*kernel_width_;	//input window size
-	weight_shape[3] = hidden_dim_;	//hidden neuron number
+	weight_shape[3] = weight_groups;
+
+	
+	
 	this->blobs_[0].reset(new Blob<Dtype>(weight_shape));
 
 	vector<int> weight_shape_hh(3);	//input-h, hx-h,hy-h
@@ -97,10 +100,11 @@ void LSTMUnitLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
 	weight_shape_hh[2] = hidden_dim_;	//hidden neuron number
 	for (int i = 1; i < 3; i++)
 		this->blobs_[i].reset(new Blob<Dtype>(weight_shape_hh));
-	this->blobs_[3].reset(new Blob<Dtype>(weight_shape));
+	
 	vector<int> weight_shape_cg(2);	//cell-gate
 	weight_shape_cg[0] = hidden_dim_;	//cell to hidden
 	weight_shape_cg[1] = 5;	//5 groups: 0 for input gate x, 1 for input gate y, 2 for forget gate x 3 for forget gate y 4 for output gate, 
+	this->blobs_[3].reset(new Blob<Dtype>(weight_shape_cg));
 	shared_ptr<Filler<Dtype> > weight_filler(GetFiller<Dtype>(
 		this->layer_param_.lstm_param().weight_filler()));
 	for (int i = 0; i < 4; i++)
@@ -109,12 +113,23 @@ void LSTMUnitLayer<Dtype>::LayerSetUp(const vector<Blob<Dtype>*>& bottom,
 	}
 	int topcount = output_height_*output_width_*hidden_dim_;
 	vector<int> map_shape;
+	map_shape.push_back(bottom[0]->num());
 	map_shape.push_back(output_height_);
 	map_shape.push_back(output_width_);
 	map_shape.push_back(hidden_dim_);
-	cell_states_map.Reshape(map_shape);
+	cell_states_map_.Reshape(map_shape);
+	input_gates_map_.Reshape(map_shape);
+	output_gates_map_.Reshape(map_shape);
+	forget_gates_map_.Reshape(map_shape);
+	net_inputs_map_.Reshape(map_shape);
+	cell_outputs_diff_.Reshape(map_shape);
+	cell_states_diff_.Reshape(map_shape);
+	input_gates_diff_.Reshape(map_shape);
+	output_gates_diff_.Reshape(map_shape);
+	forget_gates_diff_.Reshape(map_shape);
 	//caffe_set(topcount, Dtype(0), cell_states_map);
 	direction = lstm_param.direction();
+	//caffe_set(bottom[0]->count(), Dtype(0), this->blobs_);	//When should reset diff?
 }
 
 template <typename Dtype>
@@ -151,7 +166,7 @@ void LSTMUnitLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
   Dtype cell_states_y_1 = 0;
   Dtype cell_outputs_x_1 = 0;
   Dtype cell_outputs_y_1 = 0;
-  int topcount = output_width_*output_height_*hidden_dim_*n;
+  int topcount = output_width_*output_height_*hidden_dim_*bottom[0]->num();
   Dtype* cell_states_map=cell_states_map_.mutable_cpu_data();
   Dtype* input_gates_map = input_gates_map_.mutable_cpu_data();
   Dtype* output_gates_map = output_gates_map_.mutable_cpu_data();
@@ -167,40 +182,44 @@ void LSTMUnitLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
 	  {
 		  for (int oh = 0; oh < output_height_; ++oh) {
 			  for (int ow = 0; ow < output_width_; ++ow) {
-				  for (int c = 0; c < channels_; ++c) {
-					  int weight_offset = c*kernel_height_*kernel_width_*hidden_dim_*weight_groups;
-					  int sub_weight_offset = kernel_height_*kernel_width_*hidden_dim_;
-
-					  net_input = 0;
-					  input_gate = 0;
-					  output_gate = 0;
-					  forget_gate = 0;
-					  cell_states = 0;
-					  cell_output = 0;
-
-					  int hstart = oh * stride_height_;
-					  int wstart = ow * stride_width_;
-					  int hend = min(hstart + kernel_height_, input_height_);
-					  int wend = min(wstart + kernel_width_, input_width_);
-					  hstart = max(hstart, 0);
-					  wstart = max(wstart, 0);
-
-					  for (int h = hstart; h < hend; ++h) {
-						  for (int w = wstart; w < wend; ++w) {
-							  /*int h_height = hstart - hend;
-							  int w_width = wend - wstart;*/
-
-							  const int index = h * input_width_ + w;
-							  net_input += weight_ih[index + weight_offset] * bottom_data[index];
-							  input_gate += weight_ih[index + weight_offset + sub_weight_offset] * bottom_data[index];
-							  output_gate += weight_ih[index + weight_offset + sub_weight_offset * 2] * bottom_data[index];
-							  forget_gate += weight_ih[index + weight_offset + sub_weight_offset * 3] * bottom_data[index];
-						  }
-					  }
-					  bottom_data += bottom[0]->offset(0, 1);
-				  }
+				 
+				  int sub_weight_offset_h = hidden_dim_*hidden_dim_;
 					  for (int hi = 0; hi < hidden_dim_; hi++)	//hid=num_output
 					  {
+						  net_input = 0;
+						  input_gate = 0;
+						  output_gate = 0;
+						  forget_gate = 0;
+						  cell_states = 0;
+						  cell_output = 0;
+						  int weight_offset = channels_*kernel_height_*kernel_width_*hi*weight_groups;
+						  for (int c = 0; c < channels_; ++c) {
+							 
+							  int sub_weight_offset = kernel_height_*kernel_width_;
+							  int input_offset = c*input_width_*input_height_;
+							  
+
+							  int hstart = oh * stride_height_;
+							  int wstart = ow * stride_width_;
+							  int hend = min(hstart + kernel_height_, input_height_);
+							  int wend = min(wstart + kernel_width_, input_width_);
+							  hstart = max(hstart, 0);
+							  wstart = max(wstart, 0);
+							  int weight_index = 0;
+							  for (int h = hstart; h < hend; ++h) {
+								  int index = h * input_width_;
+								  for (int w = wstart; w < wend; ++w) {
+									  index += w;
+
+									  net_input += weight_ih[weight_index + weight_offset] * bottom_data[index + input_offset];
+									  input_gate += weight_ih[weight_index + weight_offset + sub_weight_offset] * bottom_data[index + input_offset];
+									  output_gate += weight_ih[weight_index + weight_offset + sub_weight_offset * 2] * bottom_data[index + input_offset];
+									  forget_gate += weight_ih[weight_index + weight_offset + sub_weight_offset * 3] * bottom_data[index + input_offset];
+									  weight_index++;
+								  }
+							  }
+							  weight_offset += c*kernel_height_*kernel_width_*weight_groups;
+						  }
 						  const int output_index = oh * output_width_ + ow + hi*output_height_*output_width_;
 						  for (int hj = 0; hj<hidden_dim_; hj++)
 						  {
@@ -221,20 +240,21 @@ void LSTMUnitLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
 							  else
 								  cell_outputs_y_1 = 0;
 							  const int weight_h_index = hi*hidden_dim_ + hj;
-							  const int weight_c_index = hi * 4 * 2;
+							  
 							  net_input += weight_hhx[weight_h_index] * cell_outputs_x_1;
 							  net_input += weight_hhy[weight_h_index] * cell_outputs_y_1;
 
-							  input_gate += weight_hhx[weight_h_index + sub_weight_offset] * cell_outputs_x_1;
-							  input_gate += weight_hhy[weight_h_index + sub_weight_offset] * cell_outputs_y_1;
+							  input_gate += weight_hhx[weight_h_index + sub_weight_offset_h] * cell_outputs_x_1;
+							  input_gate += weight_hhy[weight_h_index + sub_weight_offset_h] * cell_outputs_y_1;
 							  
-							  output_gate += weight_hhx[weight_h_index + sub_weight_offset * 2] * cell_outputs_x_1;
-							  output_gate += weight_hhy[weight_h_index + sub_weight_offset * 2] * cell_outputs_y_1;
+							  output_gate += weight_hhx[weight_h_index + sub_weight_offset_h * 2] * cell_outputs_x_1;
+							  output_gate += weight_hhy[weight_h_index + sub_weight_offset_h * 2] * cell_outputs_y_1;
 							  
-							  forget_gate += weight_hhx[weight_h_index + sub_weight_offset * 3] * cell_outputs_x_1;
-							  forget_gate += weight_hhx[weight_h_index + sub_weight_offset * 3] * cell_outputs_y_1;
+							  forget_gate += weight_hhx[weight_h_index + sub_weight_offset_h * 3] * cell_outputs_x_1;
+							  forget_gate += weight_hhx[weight_h_index + sub_weight_offset_h * 3] * cell_outputs_y_1;
 							  
 						  }
+						  const int weight_c_index = hi * 5;
 						  input_gate += weight_cg[weight_c_index] * cell_states_x_1;
 						  input_gate += weight_cg[weight_c_index + 1] * cell_states_y_1;	//8.5
 						 
@@ -244,11 +264,15 @@ void LSTMUnitLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
 						  forget_gate += weight_cg[weight_c_index + 2] * cell_states_x_1;
 						  forget_gate += weight_cg[weight_c_index + 3] * cell_states_y_1;	//8.7
 						  forget_gate = sigmoid(forget_gate);	//8.8
-						  forget_gate_map[output_index] = forget_gate;
+						  forget_gates_map[output_index] = forget_gate;
 						 
 						  net_input = tanh(net_input);	//8.9
 						  net_inputs_map[output_index] = net_input;
 						  cell_states_map[output_index] += input_gate*net_input + forget_gate*cell_states_x_1 + forget_gate*cell_states_y_1;	//8.10
+						  if (cell_states_map[output_index] > 5)
+							  cell_states_map[output_index] = 5;
+						  else if (cell_states_map[output_index] < -5)
+							  cell_states_map[output_index] = -5;
 						  output_gate += weight_cg[weight_c_index + 4] * cell_states_map[output_index];	//8.11
 						  output_gate = sigmoid(output_gate);	//8.12
 						  output_gates_map[output_index] = output_gate;
@@ -265,44 +289,49 @@ void LSTMUnitLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
 	  {
 		  for (int oh = 0; oh < output_height_; ++oh) {
 			  for (int ow = output_width_-1; ow >=0; --ow) {
-				  for (int c = 0; c < channels_; ++c) {
-					  int weight_offset = c*kernel_height_*kernel_width_*hidden_dim_*weight_groups;
-					  int sub_weight_offset = kernel_height_*kernel_width_*hidden_dim_;
-
+				  
+				  int sub_weight_offset_h = hidden_dim_*hidden_dim_;
+				  for (int hi = 0; hi < hidden_dim_; hi++)	//hid=num_output
+				  {
 					  net_input = 0;
 					  input_gate = 0;
 					  output_gate = 0;
 					  forget_gate = 0;
 					  cell_states = 0;
 					  cell_output = 0;
+					  int weight_offset = channels_*kernel_height_*kernel_width_*hi*weight_groups;
+					  for (int c = 0; c < channels_; ++c) {
+						 
+						  int sub_weight_offset = kernel_height_*kernel_width_;
+						  int input_offset = c*input_width_*input_height_;
+						 
 
-					  int hstart = oh * stride_height_;
-					  int wstart = ow * stride_width_;
-					  int hend = min(hstart + kernel_height_, input_height_);
-					  int wend = min(wstart + kernel_width_, input_width_);
-					  hstart = max(hstart, 0);
-					  wstart = max(wstart, 0);
+						  int hstart = oh * stride_height_;
+						  int wstart = ow * stride_width_;
+						  int hend = min(hstart + kernel_height_, input_height_);
+						  int wend = min(wstart + kernel_width_, input_width_);
+						  hstart = max(hstart, 0);
+						  wstart = max(wstart, 0);
+						  int weight_index = 0;
+						  for (int h = hstart; h < hend; ++h) {
+							  int index = h * input_width_;
+							  for (int w = wstart; w < wend; ++w) {
+								  index += w;
 
-					  for (int h = hstart; h < hend; ++h) {
-						  for (int w = wstart; w < wend; ++w) {
-							  /*int h_height = hstart - hend;
-							  int w_width = wend - wstart;*/
-
-							  const int index = h * input_width_ + w;
-							  net_input += weight_ih[index + weight_offset] * bottom_data[index];
-							  input_gate += weight_ih[index + weight_offset + sub_weight_offset] * bottom_data[index];
-							  output_gate += weight_ih[index + weight_offset + sub_weight_offset * 2] * bottom_data[index];
-							  forget_gate += weight_ih[index + weight_offset + sub_weight_offset * 3] * bottom_data[index];
+								  const int index = h * input_width_ + w;
+								  net_input += weight_ih[weight_index + weight_offset] * bottom_data[index + input_offset];
+								  input_gate += weight_ih[weight_index + weight_offset + sub_weight_offset] * bottom_data[index + input_offset];
+								  output_gate += weight_ih[weight_index + weight_offset + sub_weight_offset * 2] * bottom_data[index + input_offset];
+								  forget_gate += weight_ih[weight_index + weight_offset + sub_weight_offset * 3] * bottom_data[index + input_offset];
+								  weight_index++;
+							  }
 						  }
+						  weight_offset += kernel_height_*kernel_width_*weight_groups;
 					  }
-					  bottom_data += bottom[0]->offset(0, 1);
-				  }
-				  for (int hi = 0; hi < hidden_dim_; hi++)	//hid=num_output
-				  {
 					  const int output_index = oh * output_width_ + ow + hi*output_height_*output_width_;
 					  for (int hj = 0; hj<hidden_dim_; hj++)
 					  {
-						  if (ow>0)
+						  if (ow<output_width_ - 1)
 							  cell_states_x_1 = cell_states_map[output_index + 1];
 						  else
 							  cell_states_x_1 = 0;
@@ -310,7 +339,7 @@ void LSTMUnitLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
 							  cell_states_y_1 = cell_states_map[output_index - output_width_];
 						  else
 							  cell_states_y_1 = 0;
-						  if (ow>0)
+						  if (ow<output_width_ - 1)
 							  cell_outputs_x_1 = top_data[output_index + 1];
 						  else
 							  cell_outputs_x_1 = 0;
@@ -319,20 +348,20 @@ void LSTMUnitLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
 						  else
 							  cell_outputs_y_1 = 0;
 						  const int weight_h_index = hi*hidden_dim_ + hj;
-						  const int weight_c_index = hi * 4 * 2;
 						  net_input += weight_hhx[weight_h_index] * cell_outputs_x_1;
 						  net_input += weight_hhy[weight_h_index] * cell_outputs_y_1;
 
-						  input_gate += weight_hhx[weight_h_index + sub_weight_offset] * cell_outputs_x_1;
-						  input_gate += weight_hhy[weight_h_index + sub_weight_offset] * cell_outputs_y_1;
+						  input_gate += weight_hhx[weight_h_index + sub_weight_offset_h] * cell_outputs_x_1;
+						  input_gate += weight_hhy[weight_h_index + sub_weight_offset_h] * cell_outputs_y_1;
 
-						  output_gate += weight_hhx[weight_h_index + sub_weight_offset * 2] * cell_outputs_x_1;
-						  output_gate += weight_hhy[weight_h_index + sub_weight_offset * 2] * cell_outputs_y_1;
+						  output_gate += weight_hhx[weight_h_index + sub_weight_offset_h * 2] * cell_outputs_x_1;
+						  output_gate += weight_hhy[weight_h_index + sub_weight_offset_h * 2] * cell_outputs_y_1;
 
-						  forget_gate += weight_hhx[weight_h_index + sub_weight_offset * 3] * cell_outputs_x_1;
-						  forget_gate += weight_hhx[weight_h_index + sub_weight_offset * 3] * cell_outputs_y_1;
+						  forget_gate += weight_hhx[weight_h_index + sub_weight_offset_h * 3] * cell_outputs_x_1;
+						  forget_gate += weight_hhx[weight_h_index + sub_weight_offset_h * 3] * cell_outputs_y_1;
 
 					  }
+					  const int weight_c_index = hi * 5;
 					  input_gate += weight_cg[weight_c_index] * cell_states_x_1;
 					  input_gate += weight_cg[weight_c_index + 1] * cell_states_y_1;	//8.5
 
@@ -342,11 +371,15 @@ void LSTMUnitLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
 					  forget_gate += weight_cg[weight_c_index + 2] * cell_states_x_1;
 					  forget_gate += weight_cg[weight_c_index + 3] * cell_states_y_1;	//8.7
 					  forget_gate = sigmoid(forget_gate);	//8.8
-					  forget_gate_map[output_index] = forget_gate;
+					  forget_gates_map[output_index] = forget_gate;
 
 					  net_input = tanh(net_input);	//8.9
 					  net_inputs_map[output_index] = net_input;
 					  cell_states_map[output_index] += input_gate*net_input + forget_gate*cell_states_x_1 + forget_gate*cell_states_y_1;	//8.10
+					  if (cell_states_map[output_index] > 5)
+						  cell_states_map[output_index] = 5;
+					  else if (cell_states_map[output_index] < -5)
+						  cell_states_map[output_index] = -5;
 					  output_gate += weight_cg[weight_c_index + 4] * cell_states_map[output_index];	//8.11
 					  output_gate = sigmoid(output_gate);	//8.12
 					  output_gates_map[output_index] = output_gate;
@@ -361,42 +394,45 @@ void LSTMUnitLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
 	  }
 	  else if (direction == 3)	//bottom left
 	  {
-		  for (int oh = output_height_; oh >=0; --oh) {
-			  for (int ow = 0; ow <output_width; ++ow) {
-				  for (int c = 0; c < channels_; ++c) {
-					  int weight_offset = c*kernel_height_*kernel_width_*hidden_dim_*weight_groups;
-					  int sub_weight_offset = kernel_height_*kernel_width_*hidden_dim_;
-
+		  for (int oh = output_height_-1; oh >=0; --oh) {
+			  for (int ow = 0; ow <output_width_; ++ow) {
+				  
+				  int sub_weight_offset_h = hidden_dim_*hidden_dim_;
+				  for (int hi = 0; hi < hidden_dim_; hi++)	//hid=num_output
+				  {
 					  net_input = 0;
 					  input_gate = 0;
 					  output_gate = 0;
 					  forget_gate = 0;
 					  cell_states = 0;
 					  cell_output = 0;
+					  int weight_offset = channels_*kernel_height_*kernel_width_*hi*weight_groups;
+					  for (int c = 0; c < channels_; ++c) {
+						  
+						  int sub_weight_offset = kernel_height_*kernel_width_;
+						  int input_offset = input_width_*input_height_*c;
+						  
 
-					  int hstart = oh * stride_height_;
-					  int wstart = ow * stride_width_;
-					  int hend = min(hstart + kernel_height_, input_height_);
-					  int wend = min(wstart + kernel_width_, input_width_);
-					  hstart = max(hstart, 0);
-					  wstart = max(wstart, 0);
-
-					  for (int h = hstart; h < hend; ++h) {
-						  for (int w = wstart; w < wend; ++w) {
-							  /*int h_height = hstart - hend;
-							  int w_width = wend - wstart;*/
-
-							  const int index = h * input_width_ + w;
-							  net_input += weight_ih[index + weight_offset] * bottom_data[index];
-							  input_gate += weight_ih[index + weight_offset + sub_weight_offset] * bottom_data[index];
-							  output_gate += weight_ih[index + weight_offset + sub_weight_offset * 2] * bottom_data[index];
-							  forget_gate += weight_ih[index + weight_offset + sub_weight_offset * 3] * bottom_data[index];
+						  int hstart = oh * stride_height_;
+						  int wstart = ow * stride_width_;
+						  int hend = min(hstart + kernel_height_, input_height_);
+						  int wend = min(wstart + kernel_width_, input_width_);
+						  hstart = max(hstart, 0);
+						  wstart = max(wstart, 0);
+						  int weight_index = 0;
+						  for (int h = hstart; h < hend; ++h) {
+							  int index = h * input_width_;
+							  for (int w = wstart; w < wend; ++w) {
+								  index += w;
+								  net_input += weight_ih[weight_index + weight_offset] * bottom_data[index + input_offset];
+								  input_gate += weight_ih[weight_index + weight_offset + sub_weight_offset] * bottom_data[index + input_offset];
+								  output_gate += weight_ih[weight_index + weight_offset + sub_weight_offset * 2] * bottom_data[index + input_offset];
+								  forget_gate += weight_ih[weight_index + weight_offset + sub_weight_offset * 3] * bottom_data[index + input_offset];
+								  weight_index++;
+							  }
 						  }
+						  weight_offset += kernel_height_*kernel_width_*weight_groups;
 					  }
-					  bottom_data += bottom[0]->offset(0, 1);
-				  }
-				  for (int hi = 0; hi < hidden_dim_; hi++)	//hid=num_output
-				  {
 					  const int output_index = oh * output_width_ + ow + hi*output_height_*output_width_;
 					  for (int hj = 0; hj<hidden_dim_; hj++)
 					  {
@@ -404,7 +440,7 @@ void LSTMUnitLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
 							  cell_states_x_1 = cell_states_map[output_index - 1];
 						  else
 							  cell_states_x_1 = 0;
-						  if (oh>0)
+						  if (oh<output_height_ - 1)
 							  cell_states_y_1 = cell_states_map[output_index + output_width_];
 						  else
 							  cell_states_y_1 = 0;
@@ -412,25 +448,25 @@ void LSTMUnitLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
 							  cell_outputs_x_1 = top_data[output_index - 1];
 						  else
 							  cell_outputs_x_1 = 0;
-						  if (oh>0)
+						  if (oh<output_height_ - 1)
 							  cell_outputs_y_1 = top_data[output_index + output_width_];
 						  else
 							  cell_outputs_y_1 = 0;
 						  const int weight_h_index = hi*hidden_dim_ + hj;
-						  const int weight_c_index = hi * 4 * 2;
 						  net_input += weight_hhx[weight_h_index] * cell_outputs_x_1;
 						  net_input += weight_hhy[weight_h_index] * cell_outputs_y_1;
 
-						  input_gate += weight_hhx[weight_h_index + sub_weight_offset] * cell_outputs_x_1;
-						  input_gate += weight_hhy[weight_h_index + sub_weight_offset] * cell_outputs_y_1;
+						  input_gate += weight_hhx[weight_h_index + sub_weight_offset_h] * cell_outputs_x_1;
+						  input_gate += weight_hhy[weight_h_index + sub_weight_offset_h] * cell_outputs_y_1;
 
-						  output_gate += weight_hhx[weight_h_index + sub_weight_offset * 2] * cell_outputs_x_1;
-						  output_gate += weight_hhy[weight_h_index + sub_weight_offset * 2] * cell_outputs_y_1;
+						  output_gate += weight_hhx[weight_h_index + sub_weight_offset_h * 2] * cell_outputs_x_1;
+						  output_gate += weight_hhy[weight_h_index + sub_weight_offset_h * 2] * cell_outputs_y_1;
 
-						  forget_gate += weight_hhx[weight_h_index + sub_weight_offset * 3] * cell_outputs_x_1;
-						  forget_gate += weight_hhx[weight_h_index + sub_weight_offset * 3] * cell_outputs_y_1;
+						  forget_gate += weight_hhx[weight_h_index + sub_weight_offset_h * 3] * cell_outputs_x_1;
+						  forget_gate += weight_hhx[weight_h_index + sub_weight_offset_h * 3] * cell_outputs_y_1;
 
 					  }
+					  const int weight_c_index = hi * 5;
 					  input_gate += weight_cg[weight_c_index] * cell_states_x_1;
 					  input_gate += weight_cg[weight_c_index + 1] * cell_states_y_1;	//8.5
 
@@ -440,11 +476,15 @@ void LSTMUnitLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
 					  forget_gate += weight_cg[weight_c_index + 2] * cell_states_x_1;
 					  forget_gate += weight_cg[weight_c_index + 3] * cell_states_y_1;	//8.7
 					  forget_gate = sigmoid(forget_gate);	//8.8
-					  forget_gate_map[output_index] = forget_gate;
+					  forget_gates_map[output_index] = forget_gate;
 
 					  net_input = tanh(net_input);	//8.9
 					  net_inputs_map[output_index] = net_input;
 					  cell_states_map[output_index] += input_gate*net_input + forget_gate*cell_states_x_1 + forget_gate*cell_states_y_1;	//8.10
+					  if (cell_states_map[output_index] > 5)
+						  cell_states_map[output_index] = 5;
+					  else if (cell_states_map[output_index] < -5)
+						  cell_states_map[output_index] = -5;
 					  output_gate += weight_cg[weight_c_index + 4] * cell_states_map[output_index];	//8.11
 					  output_gate = sigmoid(output_gate);	//8.12
 					  output_gates_map[output_index] = output_gate;
@@ -459,76 +499,79 @@ void LSTMUnitLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
 	  }
 	  else if (direction == 4)	//bottom right
 	  {
-		  for (int oh = output_height_; oh >= 0; --oh) {
-			  for (int ow = output_width; ow >=0; --ow) {
-				  for (int c = 0; c < channels_; ++c) {
-					  int weight_offset = c*kernel_height_*kernel_width_*hidden_dim_*weight_groups;
-					  int sub_weight_offset = kernel_height_*kernel_width_*hidden_dim_;
-
+		  for (int oh = output_height_-1; oh >= 0; --oh) {
+			  for (int ow = output_width_-1; ow >=0; --ow) {
+				 
+				  int sub_weight_offset_h = hidden_dim_*hidden_dim_;
+				  for (int hi = 0; hi < hidden_dim_; hi++)	//hid=num_output
+				  {
 					  net_input = 0;
 					  input_gate = 0;
 					  output_gate = 0;
 					  forget_gate = 0;
 					  cell_states = 0;
 					  cell_output = 0;
+					  int weight_offset = channels_*kernel_height_*kernel_width_*hi*weight_groups;
+					  for (int c = 0; c < channels_; ++c) {
+						  
+						  int sub_weight_offset = kernel_height_*kernel_width_;
+						  int input_offset = input_width_*input_height_*c;
+						 
 
-					  int hstart = oh * stride_height_;
-					  int wstart = ow * stride_width_;
-					  int hend = min(hstart + kernel_height_, input_height_);
-					  int wend = min(wstart + kernel_width_, input_width_);
-					  hstart = max(hstart, 0);
-					  wstart = max(wstart, 0);
-
-					  for (int h = hstart; h < hend; ++h) {
-						  for (int w = wstart; w < wend; ++w) {
-							  /*int h_height = hstart - hend;
-							  int w_width = wend - wstart;*/
-
-							  const int index = h * input_width_ + w;
-							  net_input += weight_ih[index + weight_offset] * bottom_data[index];
-							  input_gate += weight_ih[index + weight_offset + sub_weight_offset] * bottom_data[index];
-							  output_gate += weight_ih[index + weight_offset + sub_weight_offset * 2] * bottom_data[index];
-							  forget_gate += weight_ih[index + weight_offset + sub_weight_offset * 3] * bottom_data[index];
+						  int hstart = oh * stride_height_;
+						  int wstart = ow * stride_width_;
+						  int hend = min(hstart + kernel_height_, input_height_);
+						  int wend = min(wstart + kernel_width_, input_width_);
+						  hstart = max(hstart, 0);
+						  wstart = max(wstart, 0);
+						  int weight_index = 0;
+						  for (int h = hstart; h < hend; ++h) {
+							  int index = h * input_width_;
+							  for (int w = wstart; w < wend; ++w) {
+								  index += w;
+								  net_input += weight_ih[weight_index + weight_offset]*bottom_data[index + input_offset];
+								  input_gate += weight_ih[weight_index + weight_offset + sub_weight_offset] * bottom_data[index + input_offset];
+								  output_gate += weight_ih[weight_index + weight_offset + sub_weight_offset * 2] * bottom_data[index + input_offset];
+								  forget_gate += weight_ih[weight_index + weight_offset + sub_weight_offset * 3] * bottom_data[index + input_offset];
+								  weight_index++;
+							  }
 						  }
+						  weight_offset += kernel_height_*kernel_width_*weight_groups;
 					  }
-					  bottom_data += bottom[0]->offset(0, 1);
-				  }
-				  for (int hi = 0; hi < hidden_dim_; hi++)	//hid=num_output
-				  {
 					  const int output_index = oh * output_width_ + ow + hi*output_height_*output_width_;
 					  for (int hj = 0; hj<hidden_dim_; hj++)
 					  {
-						  if (ow>0)
+						  if (ow<output_width_-1)
 							  cell_states_x_1 = cell_states_map[output_index + 1];
 						  else
 							  cell_states_x_1 = 0;
-						  if (oh>0)
+						  if (oh<output_height_-1)
 							  cell_states_y_1 = cell_states_map[output_index + output_width_];
 						  else
 							  cell_states_y_1 = 0;
-						  if (ow>0)
+						  if (ow<output_width_ - 1)
 							  cell_outputs_x_1 = top_data[output_index + 1];
 						  else
 							  cell_outputs_x_1 = 0;
-						  if (oh>0)
+						  if (oh<output_height_ - 1)
 							  cell_outputs_y_1 = top_data[output_index + output_width_];
 						  else
 							  cell_outputs_y_1 = 0;
 						  const int weight_h_index = hi*hidden_dim_ + hj;
-						  const int weight_c_index = hi * 4 * 2;
 						  net_input += weight_hhx[weight_h_index] * cell_outputs_x_1;
 						  net_input += weight_hhy[weight_h_index] * cell_outputs_y_1;
 
-						  input_gate += weight_hhx[weight_h_index + sub_weight_offset] * cell_outputs_x_1;
-						  input_gate += weight_hhy[weight_h_index + sub_weight_offset] * cell_outputs_y_1;
+						  input_gate += weight_hhx[weight_h_index + sub_weight_offset_h] * cell_outputs_x_1;
+						  input_gate += weight_hhy[weight_h_index + sub_weight_offset_h] * cell_outputs_y_1;
 
-						  output_gate += weight_hhx[weight_h_index + sub_weight_offset * 2] * cell_outputs_x_1;
-						  output_gate += weight_hhy[weight_h_index + sub_weight_offset * 2] * cell_outputs_y_1;
+						  output_gate += weight_hhx[weight_h_index + sub_weight_offset_h * 2] * cell_outputs_x_1;
+						  output_gate += weight_hhy[weight_h_index + sub_weight_offset_h * 2] * cell_outputs_y_1;
 
-						  forget_gate += weight_hhx[weight_h_index + sub_weight_offset * 3] * cell_outputs_x_1;
-						  forget_gate += weight_hhx[weight_h_index + sub_weight_offset * 3] * cell_outputs_y_1;
+						  forget_gate += weight_hhx[weight_h_index + sub_weight_offset_h * 3] * cell_outputs_x_1;
+						  forget_gate += weight_hhx[weight_h_index + sub_weight_offset_h * 3] * cell_outputs_y_1;
 
 					  }
+					  const int weight_c_index = hi * 5;
 					  input_gate += weight_cg[weight_c_index] * cell_states_x_1;
 					  input_gate += weight_cg[weight_c_index + 1] * cell_states_y_1;	//8.5
 
@@ -538,30 +581,381 @@ void LSTMUnitLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
 					  forget_gate += weight_cg[weight_c_index + 2] * cell_states_x_1;
 					  forget_gate += weight_cg[weight_c_index + 3] * cell_states_y_1;	//8.7
 					  forget_gate = sigmoid(forget_gate);	//8.8
-					  forget_gate_map[output_index] = forget_gate;
+					  forget_gates_map[output_index] = forget_gate;
 
 					  net_input = tanh(net_input);	//8.9
 					  net_inputs_map[output_index] = net_input;
 					  cell_states_map[output_index] += input_gate*net_input + forget_gate*cell_states_x_1 + forget_gate*cell_states_y_1;	//8.10
+					 
+					  if (cell_states_map[output_index] > 5)
+						  cell_states_map[output_index] = 5;
+					  else if (cell_states_map[output_index] < -5)
+						  cell_states_map[output_index] = -5;
+					  /*if (cell_states_map[output_index] != cell_states_map[output_index])
+					  {
+						  Dtype tempdouble = cell_states_map[output_index];
+						  tempdouble = cell_states_map[output_index + 1];
+						  tempdouble = cell_states_map[output_index + output_width_];
+					  }*/
 					  output_gate += weight_cg[weight_c_index + 4] * cell_states_map[output_index];	//8.11
 					  output_gate = sigmoid(output_gate);	//8.12
 					  output_gates_map[output_index] = output_gate;
 					  cell_output = output_gate*tanh(cell_states_map[output_index]);	//8.13
 					  top_data[output_index] = cell_output;
-
+					  if (abs(top_data[output_index] > 10))
+						  int tempint = 0;
 				  }
-
+				//  printf("x:%d y:%d\n", ow, oh);
 			  }
 
 		  }
+		  //for (int hh = 0; hh < hidden_dim_; hh++)
+		  //{
+			 // tempchar[0] = '\0';
+			 // sprintf(tempchar, "cell_states_map%d_%d.txt", n, hh);
+			 // FILE* fp = fopen(tempchar, "w");
+			 // for (int i = 0; i < output_height_; i++)
+			 // {
+				//  for (int j = 0; j < output_width_; j++)
+				//  {
+				//	  const int output_index = i * output_width_ + j + hh*output_width_*output_height_;
+				//	  fprintf(fp, "%f\t", cell_states_map[output_index]);
+				//  }
+				//  fprintf(fp, "\n");
+			 // }
+			 // fclose(fp);
+		  //}
+		  //for (int hh = 0; hh < hidden_dim_; hh++)
+		  //{
+			 // tempchar[0] = '\0';
+			 // sprintf(tempchar, "cell_input%d_%d.txt", n, hh);
+			 // FILE* fp = fopen(tempchar, "w");
+			 // for (int i = 0; i < output_height_; i++)
+			 // {
+				//  for (int j = 0; j < output_width_; j++)
+				//  {
+				//	  const int output_index = i * output_width_ + j + hh*output_width_*output_height_;
+				//	  fprintf(fp, "%f\t", net_inputs_map[output_index]);
+				//  }
+				//  fprintf(fp, "\n");
+			 // }
+			 // fclose(fp);
+		  //}
+		  //for (int hh = 0; hh < hidden_dim_; hh++)
+		  //{
+			 // tempchar[0] = '\0';
+			 // sprintf(tempchar, "cell_output%d_%d.txt", n, hh);
+			 // FILE* fp = fopen(tempchar, "w");
+			 // for (int i = 0; i < output_height_; i++)
+			 // {
+				//  for (int j = 0; j < output_width_; j++)
+				//  {
+				//	  const int output_index = i * output_width_ + j + hh*output_width_*output_height_;
+				//	  fprintf(fp, "%f\t", top_data[output_index]);
+				//  }
+				//  fprintf(fp, "\n");
+			 // }
+			 // fclose(fp);
+		  //}
+		  //tempchar[0] = '\0';
+		  //for (int c = 0; c < channels_; c++)
+		  //{
+			 // sprintf(tempchar, "input%d_%d.txt", n, c);
+			 // FILE* fp = fopen(tempchar, "w");
+			 // for (int i = 0; i < input_height_; i++)
+			 // {
+				//  for (int j = 0; j < input_width_; j++)
+				//  {
+				//	  const int input_index = i * input_width_ + j + c*input_width_*input_height_;
+				//	  fprintf(fp, "%f\t", bottom_data[input_index]);
+				//  }
+				//  fprintf(fp, "\n");
+			 // }
+			 // fclose(fp);
+		  //}
+		  /*FILE* fp;
+		  tempchar[0] = '\0';
+		  sprintf(tempchar, "top_data%d.txt", n);
+		  fopen_s(&fp, tempchar, "w");
+		  int tempcount = 0;
+		  for (int i = 0; i < output_height_; i++)
+		  {
+			  for (int j = 0; j < output_width_; j++)
+			  {
+				  fprintf(fp, "%f\t", top_data[tempcount]);
+				  tempcount++;
+			  }
+			  fprintf(fp, "\n");
+		  }
+		  fclose(fp);*/
 	  }
+	  
+	  bottom_data += bottom[0]->offset(1, 0);
 	  top_data += top[0]->offset(1, 0);
 	  cell_states_map += top[0]->offset(1, 0);
 	  input_gates_map += top[0]->offset(1, 0);
 	  output_gates_map += top[0]->offset(1, 0);
 	  forget_gates_map += top[0]->offset(1, 0);
+	  net_inputs_map += top[0]->offset(1, 0);
+	 
+  }
+  bottom_data -= bottom[0]->offset(bottom[0]->num(), 0);
+  top_data -= top[0]->offset(top[0]->num(), 0);
+  cell_states_map -= top[0]->offset(top[0]->num(), 0);
+  input_gates_map -= top[0]->offset(top[0]->num(), 0);
+  output_gates_map -= top[0]->offset(top[0]->num(), 0);
+  forget_gates_map -= top[0]->offset(top[0]->num(), 0);
+  net_inputs_map -= top[0]->offset(top[0]->num(), 0);
+ /* FILE* fp;
+  fopen_s(&fp, "weight_ih.txt", "w");
+  int weight_index = 0;
+  int sub_weight_offset = 0;
+  int sub_weight_offset_h = 0;
+  for (int hi = 0; hi < hidden_dim_; hi++)
+  {
+	  int weight_offset = channels_*kernel_height_*kernel_width_*hi*weight_groups;
+	  for (int c = 0; c < channels_; ++c)
+	  {
+		  weight_index = 0;
+		  for (int h = 0; h < kernel_height_; ++h) {
+			  for (int w = 0; w < kernel_width_; ++w) {
+				  fprintf(fp, "%f\t", weight_ih[weight_index + weight_offset]);
+				  weight_index++;
+			  }
+			  fprintf(fp, "\n");
+		  }
+		  weight_offset += kernel_height_*kernel_width_*weight_groups;
+	  }
+	  fprintf(fp, "\n");
+	  weight_offset = channels_*kernel_height_*kernel_width_*hi*weight_groups;
+	  for (int c = 0; c < channels_; ++c)
+	  {
+		  weight_index = 0;
+		  for (int h = 0; h < kernel_height_; ++h) {
+			  for (int w = 0; w < kernel_width_; ++w) {
+				  fprintf(fp, "%f\t", weight_ih[weight_index + weight_offset + sub_weight_offset]);
+				  weight_index++;
+			  }
+			  fprintf(fp, "\n");
+		  }
+		  weight_offset += kernel_height_*kernel_width_*weight_groups;
+	  }
+	  fprintf(fp, "\n");
+	  weight_offset = channels_*kernel_height_*kernel_width_*hi*weight_groups;
+	  for (int c = 0; c < channels_; ++c)
+	  {
+		  weight_index = 0;
+		  for (int h = 0; h < kernel_height_; ++h) {
+			  int index = h * kernel_width_;
+			  for (int w = 0; w < kernel_width_; ++w) {
+				  index += w;
+				  fprintf(fp, "%f\t", weight_ih[weight_index + weight_offset + sub_weight_offset * 2]);
+				  weight_index++;
+			  }
+			  fprintf(fp, "\n");
+		  }
+		  weight_offset += kernel_height_*kernel_width_*weight_groups;
+	  }
+	  fprintf(fp, "\n");
+	  weight_offset = channels_*kernel_height_*kernel_width_*hi*weight_groups;
+	  for (int c = 0; c < channels_; ++c)
+	  {
+		  weight_index = 0;
+		  for (int h = 0; h < kernel_height_; ++h) {
+			  for (int w = 0; w < kernel_width_; ++w) {
+				  fprintf(fp, "%f\t", weight_ih[weight_index + weight_offset + sub_weight_offset * 3]);
+				  weight_index++;
+			  }
+			  fprintf(fp, "\n");
+		  }
+		  weight_offset += kernel_height_*kernel_width_*weight_groups;
+	  }
   }
 
+  fclose(fp);
+  fopen_s(&fp, "weight_hhx.txt", "w");
+
+  for (int hi = 0; hi < hidden_dim_; hi++)
+  {
+	  for (int hj = 0; hj<hidden_dim_; hj++)
+	  {
+		  const int weight_h_index = hi*hidden_dim_ + hj;
+		  fprintf(fp, "%f\t", weight_hhx[weight_h_index]);
+	  }
+	  fprintf(fp, "\n");
+  }
+  for (int hi = 0; hi < hidden_dim_; hi++)
+  {
+	  for (int hj = 0; hj<hidden_dim_; hj++)
+	  {
+		  const int weight_h_index = hi*hidden_dim_ + hj;
+		  fprintf(fp, "%f\t", weight_hhx[weight_h_index + sub_weight_offset_h]);
+	  }
+	  fprintf(fp, "\n");
+  }
+  for (int hi = 0; hi < hidden_dim_; hi++)
+  {
+	  for (int hj = 0; hj<hidden_dim_; hj++)
+	  {
+		  const int weight_h_index = hi*hidden_dim_ + hj;
+		  fprintf(fp, "%f\t", weight_hhx[weight_h_index + sub_weight_offset_h * 2]);
+	  }
+	  fprintf(fp, "\n");
+  }
+  for (int hi = 0; hi < hidden_dim_; hi++)
+  {
+	  for (int hj = 0; hj<hidden_dim_; hj++)
+	  {
+		  const int weight_h_index = hi*hidden_dim_ + hj;
+		  fprintf(fp, "%f\t", weight_hhx[weight_h_index + sub_weight_offset_h * 3]);
+	  }
+	  fprintf(fp, "\n");
+  }
+  fclose(fp);
+  fopen_s(&fp, "weight_hhy.txt", "w");
+  for (int hi = 0; hi < hidden_dim_; hi++)
+  {
+	  for (int hj = 0; hj<hidden_dim_; hj++)
+	  {
+		  const int weight_h_index = hi*hidden_dim_ + hj;
+		  fprintf(fp, "%f\t", weight_hhy[weight_h_index]);
+	  }
+	  fprintf(fp, "\n");
+  }
+  for (int hi = 0; hi < hidden_dim_; hi++)
+  {
+	  for (int hj = 0; hj<hidden_dim_; hj++)
+	  {
+		  const int weight_h_index = hi*hidden_dim_ + hj;
+		  fprintf(fp, "%f\t", weight_hhy[weight_h_index + sub_weight_offset_h]);
+	  }
+	  fprintf(fp, "\n");
+  }
+  for (int hi = 0; hi < hidden_dim_; hi++)
+  {
+	  for (int hj = 0; hj<hidden_dim_; hj++)
+	  {
+		  const int weight_h_index = hi*hidden_dim_ + hj;
+		  fprintf(fp, "%f\t", weight_hhy[weight_h_index + sub_weight_offset_h * 2]);
+	  }
+	  fprintf(fp, "\n");
+  }
+  for (int hi = 0; hi < hidden_dim_; hi++)
+  {
+	  for (int hj = 0; hj<hidden_dim_; hj++)
+	  {
+		  const int weight_h_index = hi*hidden_dim_ + hj;
+		  fprintf(fp, "%f\t", weight_hhy[weight_h_index + sub_weight_offset_h * 3]);
+	  }
+	  fprintf(fp, "\n");
+  }
+
+  fclose(fp);
+  fopen_s(&fp, "weight_cg.txt", "w");
+  for (int hi = 0; hi < hidden_dim_; hi++)
+  {
+	  for (int hj = 0; hj<5; hj++)
+	  {
+		  const int weight_h_index = hi*hidden_dim_ + hj;
+		  fprintf(fp, "%f\t", weight_cg[weight_h_index]);
+	  }
+	  fprintf(fp, "\n");
+  }
+  fclose(fp);
+  for (int n = 0; n < bottom[0]->num(); n++)
+  {
+	  tempchar[0] = '\0';
+	  sprintf(tempchar, "cell_states_map%d.txt", n);
+	  fopen_s(&fp, tempchar, "w");
+	  for (int h = 0; h < hidden_dim_; h++)
+	  for (int i = 0; i < output_height_; i++)
+	  {
+		  for (int j = 0; j < output_width_; j++)
+		  {
+			  fprintf(fp, "%f\t", *cell_states_map);
+			  cell_states_map++;
+		  }
+		  fprintf(fp, "\n");
+	  }
+	  fclose(fp);
+	  tempchar[0] = '\0';
+	  sprintf(tempchar, "input_gates_map%d.txt", n);
+	  fopen_s(&fp, tempchar, "w");
+	  for (int h = 0; h < hidden_dim_; h++)
+	  for (int i = 0; i < output_height_; i++)
+	  {
+		  for (int j = 0; j < output_width_; j++)
+		  {
+			  fprintf(fp, "%f\t", *input_gates_map);
+			  input_gates_map++;
+		  }
+		  fprintf(fp, "\n");
+	  }
+	  fclose(fp);
+	  tempchar[0] = '\0';
+	  sprintf(tempchar, "output_gates_map%d.txt", n);
+	  fopen_s(&fp, tempchar, "w");
+	  for (int h = 0; h < hidden_dim_; h++)
+	  for (int i = 0; i < output_height_; i++)
+	  {
+		  for (int j = 0; j < output_width_; j++)
+		  {
+			  fprintf(fp, "%f\t", *output_gates_map);
+			  output_gates_map++;
+		  }
+		  fprintf(fp, "\n");
+	  }
+	  fclose(fp);
+	  tempchar[0] = '\0';
+	  sprintf(tempchar, "forget_gates_map%d.txt", n);
+	  fopen_s(&fp, tempchar, "w");
+	  for (int h = 0; h < hidden_dim_; h++)
+	  for (int i = 0; i < output_height_; i++)
+	  {
+		  for (int j = 0; j < output_width_; j++)
+		  {
+			  fprintf(fp, "%f\t", *forget_gates_map);
+			  forget_gates_map++;
+		  }
+		  fprintf(fp, "\n");
+	  }
+	  fclose(fp);
+
+	  tempchar[0] = '\0';
+	  sprintf(tempchar, "top_data%d.txt", n);
+	  fopen_s(&fp, tempchar, "w");
+	  for (int h = 0; h < hidden_dim_; h++)
+	  {
+		  for (int i = 0; i < output_height_; i++)
+		  {
+			  for (int j = 0; j < output_width_; j++)
+			  {
+				  fprintf(fp, "%f\t", *top_data);
+				  top_data++;
+			  }
+			  fprintf(fp, "\n");
+		  }
+	  }
+	  fclose(fp);
+	  tempchar[0] = '\0';
+	  sprintf(tempchar, "bottom_data%d.txt", n);
+	  fopen_s(&fp, tempchar, "w");
+	  for (int c = 0; c < channels_; c++)
+	  {
+		  for (int i = 0; i < input_height_; i++)
+		  {
+			  for (int j = 0; j < input_width_; j++)
+			  {
+				  fprintf(fp, "%f\t", *bottom_data);
+				  bottom_data++;
+			  }
+			  fprintf(fp, "\n");
+		  }
+	  }
+	  fclose(fp);
+
+
+  }*/
   //const int num = bottom[0]->shape(1);
   //const int x_dim = hidden_dim_ * 4;
   //const Dtype* C_prev = bottom[0]->cpu_data();
@@ -593,12 +987,11 @@ void LSTMUnitLayer<Dtype>::Forward_cpu(const vector<Blob<Dtype>*>& bottom,
 template <typename Dtype>
 void LSTMUnitLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
     const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) {
-  CHECK(!propagate_down[2]) << "Cannot backpropagate to sequence indicators.";
-  if (!propagate_down[0] && !propagate_down[1]) { return; }
+  CHECK(!propagate_down[0]) << "Cannot backpropagate to sequence indicators.";
   const Dtype* top_diff = top[0]->cpu_diff();
   const Dtype* bottom_data = bottom[0]->cpu_data();
-  caffe_set(bottom[0]->count(), Dtype(0), bottom_diff);
-  const Dtype* cell_states_map = cell_states_map_.cpu_data();
+  const Dtype* top_data = top[0]->cpu_data();
+  Dtype* bottom_diff = bottom[0]->mutable_cpu_diff();
   //Dtype* cell_outputs_diff = cell_outputs_diff_.mutable_cpu_data();
   Dtype* cell_states_diff = cell_states_diff_.mutable_cpu_data();
   Dtype* input_gates_diff = input_gates_diff_.mutable_cpu_data();
@@ -621,19 +1014,29 @@ void LSTMUnitLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
   Dtype cell_states_y1 = 0;
   Dtype forget_gate1 = 0;
   Dtype cell_input_diff = 0;
+  Dtype input_gate_diff_x1 = 0;
+  Dtype input_gate_diff_y1 = 0;
+  Dtype output_gate_diff_x1 = 0;
+  Dtype output_gate_diff_y1 = 0;
+  Dtype forget_gate_diff_x1 = 0;
+  Dtype forget_gate_diff_y1 = 0;
   Dtype forget_gate_x1 = 0;
   Dtype forget_gate_y1 = 0;
   Dtype cell_states_x_1 = 0;
   Dtype cell_states_y_1 = 0;
+  Dtype cell_outputs_x_1 = 0;
+  Dtype cell_outputs_y_1 = 0;
   const Dtype* weight_ih = this->blobs_[0]->cpu_data();
   const Dtype* weight_hhx = this->blobs_[1]->cpu_data();
   const Dtype* weight_hhy = this->blobs_[2]->cpu_data();
   const Dtype* weight_cg = this->blobs_[3]->cpu_data();
-  int bottomcount = input_width_*output_height_*hidden_dim_;
-  caffe_set(cell_states_diff_->count(), Dtype(0), cell_states_diff);
-  caffe_set(input_gates_diff_->count(), Dtype(0), input_gates_diff);
-  caffe_set(output_gates_diff_->count(), Dtype(0), output_gates_diff);
-  caffe_set(forget_gates_diff_->count(), Dtype(0), forget_gates_diff);
+  int bottomcount = bottom[0]->count();
+  int topcount = top[0]->count();
+
+  caffe_set(topcount, Dtype(0), cell_states_diff);
+  caffe_set(topcount, Dtype(0), input_gates_diff);
+  caffe_set(topcount, Dtype(0), output_gates_diff);
+  caffe_set(topcount, Dtype(0), forget_gates_diff);
   Dtype* dw_ih = this->blobs_[0]->mutable_cpu_diff();
   Dtype* dw_hhx = this->blobs_[1]->mutable_cpu_diff();
   Dtype* dw_hhy = this->blobs_[2]->mutable_cpu_diff();
@@ -648,11 +1051,11 @@ void LSTMUnitLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
 				  {
 					  const int output_index = oh * output_width_ + ow + hi*output_height_*output_width_;
 					  if (ow<output_width_ - 1)
-						  cell_outputs_diff_x1 = top_data[output_index + 1];
+						  cell_outputs_diff_x1 = top_diff[output_index + 1];
 					  else
 						  cell_outputs_diff_x1 = 0;
 					  if (oh<output_height_ - 1)
-						  cell_outputs_diff_y1 = top_data[output_index + output_width_];
+						  cell_outputs_diff_y1 = top_diff[output_index + output_width_];
 					  else
 						  cell_outputs_diff_y1 = 0;
 					  if (ow<output_width_ - 1)
@@ -680,11 +1083,11 @@ void LSTMUnitLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
 					  else
 						  forget_gate_diff_y1 = 0;
 					  if (ow<output_width_ - 1)
-						  forget_gate_x1 = forget_gate_map[output_index + 1];
+						  forget_gate_x1 = forget_gates_map[output_index + 1];
 					  else
 						  forget_gate_x1 = 0;
 					  if (oh<output_height_ - 1)
-						  forget_gate_y1 = forget_gate_map[output_index + output_width_];
+						  forget_gate_y1 = forget_gates_map[output_index + output_width_];
 					  else
 						  forget_gate_y1 = 0;
 
@@ -704,31 +1107,103 @@ void LSTMUnitLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
 						  cell_states_y_1 = cell_states_map[output_index - output_width_];
 					  else
 						  cell_states_y_1 = 0;
-					  cell_outputs_diff = top_data[output_index];
+					  if (ow>0)
+						  cell_outputs_x_1 = top_data[output_index - 1];
+					  else
+						  cell_outputs_x_1 = 0;
+					  if (oh>0)
+						  cell_outputs_y_1 = top_data[output_index - output_width_];
+					  else
+						  cell_outputs_y_1 = 0;
+					  cell_outputs_diff = top_diff[output_index];
+					  //need adding hstart
+					  const int sub_weight_offset = kernel_height_*kernel_width_;
+					  const int sub_weight_offset_h = hidden_dim_*hidden_dim_;
+					  
+					  const int weight_c_index = hi * 5;
 					  for (int hj = 0; hj<hidden_dim_; hj++)
 					  {
 						  
 						  const int weight_h_index = hi*hidden_dim_ + hj;
-						  const int weight_c_index = hi * 4 * 2;
+						 
 						  
 						  cell_outputs_diff += weight_hhx[weight_h_index] * cell_outputs_diff_x1;
-						  cell_outputs_diff += weight_hhy[weight_h_index] * cell_outputs_diff_y1;	//Equation 8.15
-
-						  output_gates_diff[output_index] += weight_hhx[weight_h_index + sub_weight_offset * 2] * 
-							  cell_outputs_diff*tanh(cell_states_map[output_index])*dsigmoid(output_gates_map[output_index]);	//Equation 8.16
+						  cell_outputs_diff += weight_hhy[weight_h_index] * cell_outputs_diff_y1;	
+						  cell_outputs_diff += weight_hhx[weight_h_index + sub_weight_offset_h] * input_gate_diff_x1;
+						  cell_outputs_diff += weight_hhy[weight_h_index + sub_weight_offset_h] * input_gate_diff_y1;
+						  cell_outputs_diff += weight_hhx[weight_h_index + sub_weight_offset_h*2] * output_gate_diff_x1;
+						  cell_outputs_diff += weight_hhy[weight_h_index + sub_weight_offset_h*2] * output_gate_diff_y1;
+						  cell_outputs_diff += weight_hhx[weight_h_index + sub_weight_offset_h*3] * forget_gate_diff_x1;
+						  cell_outputs_diff += weight_hhy[weight_h_index + sub_weight_offset_h*3] * forget_gate_diff_y1;	//Equation 8.15
 					  }
-					  cell_states_diff[output_index] = output_gates_map[output_index] * dtanh(cell_outputs_map[output_index])*cell_gates_diff[output_index];
-					  cell_states_diff[oupput_index] += weight_cg[weight_c_index] * input_gate_diff_x1;
-					  cell_states_diff[oupput_index] += weight_cg[weight_c_index + 1] * input_gate_diff_y1;
+					  output_gates_diff[output_index] = cell_outputs_diff*tanh(cell_states_map[output_index])*dsigmoid(output_gates_map[output_index]);	//Equation 8.16
+
+					  cell_states_diff[output_index] = output_gates_map[output_index] * dtanh(top_data[output_index])*cell_outputs_diff;
+					  cell_states_diff[output_index] += weight_cg[weight_c_index] * input_gate_diff_x1;
+					  cell_states_diff[output_index] += weight_cg[weight_c_index + 1] * input_gate_diff_y1;
 					  
 					  cell_states_diff[output_index] += weight_cg[weight_c_index + 2] * forget_gate_diff_x1;
 					  cell_states_diff[output_index] += weight_cg[weight_c_index + 3] * forget_gate_diff_y1;
-					  cell_states_diff[oupput_index] += weight_cg[weight_c_index + 4] * output_gate_diff[output_index];
+					  cell_states_diff[output_index] += weight_cg[weight_c_index + 4] * output_gate_diff;
 					  cell_states_diff[output_index] += forget_gate_x1*cell_states_x1;
 					  cell_states_diff[output_index] += forget_gate_y1*cell_states_y1;//Equation 8.17
 					  cell_input_diff = input_gates_map[output_index] * dtanh(net_inputs_map[output_index])*cell_states_diff[output_index];	//Equation 8.18
-					  forget_gates_diff = dsigmoid(forget_gates_map[output_index])*cell_states_diff[output_index]*(cell_states_x_1 + cell_states_y_1);	//Equation 8.19
-					  input_gates_diff = dsigmoid(input_gates_map[output_index])*cell_states_diff[output_index] * net_inputs_map[output_index];	//Eqaaution 8.20
+					  forget_gates_diff[output_index] = dsigmoid(forget_gates_map[output_index])*cell_states_diff[output_index] * (cell_states_x_1 + cell_states_y_1);	//Equation 8.19
+					  input_gates_diff[output_index] = dsigmoid(input_gates_map[output_index])*cell_states_diff[output_index] * net_inputs_map[output_index];	//Eqaaution 8.20
+
+					  int hstart = oh * stride_height_;
+					  int wstart = ow * stride_width_;
+					  int hend = min(hstart + kernel_height_, input_height_);
+					  int wend = min(wstart + kernel_width_, input_width_);
+					  hstart = max(hstart, 0);
+					  wstart = max(wstart, 0);
+					  
+					  int weight_offset = kernel_height_*kernel_width_*hi*channels_*weight_groups;
+					  for (int c = 0; c < channels_; ++c)
+					  {
+						  int weight_index = 0;
+						  for (int h = hstart; h < hend; ++h) {
+							  for (int w = wstart; w < wend; ++w) {
+								  int index = h * input_width_ + c*input_height_*input_width_ + w;
+								  dw_ih[weight_index + weight_offset] += bottom_data[index] * cell_input_diff;
+								  dw_ih[weight_index + weight_offset + sub_weight_offset] += bottom_data[index] * input_gates_diff[output_index];
+								  dw_ih[weight_index + weight_offset + sub_weight_offset * 2] += bottom_data[index] * output_gates_diff[output_index];
+								  dw_ih[weight_index + weight_offset + sub_weight_offset * 3] += bottom_data[index] * forget_gates_diff[output_index];
+								  bottom_diff[index] += weight_ih[weight_index + weight_offset] * cell_input_diff;
+								  bottom_diff[index] += weight_ih[weight_index + weight_offset + sub_weight_offset] * input_gates_diff[output_index];
+								  bottom_diff[index] += weight_ih[weight_index + weight_offset + sub_weight_offset * 2] * output_gates_diff[output_index];
+								  bottom_diff[index] += weight_ih[weight_index + weight_offset + sub_weight_offset * 3] * forget_gates_diff[output_index];
+								  weight_index++;
+							  }
+						  }
+						  weight_offset += kernel_height_*kernel_width_*weight_groups;
+					  }
+						  
+					 
+					 
+					  for (int hj = 0; hj < hidden_dim_; hj++)
+					  {
+						  const int weight_h_index = hj*hidden_dim_ + hi;
+						  dw_hhx[weight_h_index] += cell_input_diff*cell_outputs_x_1;
+						  dw_hhy[weight_h_index] += cell_input_diff*cell_outputs_y_1;
+
+						  dw_hhx[weight_h_index + sub_weight_offset_h] += input_gates_diff[output_index] * cell_outputs_x_1;
+						  dw_hhy[weight_h_index + sub_weight_offset_h] += input_gates_diff[output_index] * cell_outputs_y_1;
+
+						  dw_hhx[weight_h_index + sub_weight_offset_h * 2] += output_gates_diff[output_index] * cell_outputs_x_1;
+						  dw_hhy[weight_h_index + sub_weight_offset_h * 2] += output_gates_diff[output_index] * cell_outputs_y_1;
+
+						  dw_hhx[weight_h_index + sub_weight_offset_h * 3] += forget_gates_diff[output_index] * cell_outputs_x_1;
+						  dw_hhy[weight_h_index + sub_weight_offset_h * 3] += forget_gates_diff[output_index] * cell_outputs_y_1;
+
+
+					  }
+					  
+					  dw_cg[hi * 5] += cell_states_x_1 * input_gates_diff[output_index];
+					  dw_cg[hi * 5 + 1] += cell_states_y_1* input_gates_diff[output_index];
+					  dw_cg[hi * 5 + 2] += cell_states_x_1 * forget_gates_diff[output_index];
+					  dw_cg[hi * 5 + 3] += cell_states_y_1* forget_gates_diff[output_index];
+					  dw_cg[hi * 5 + 4] += cell_states_map[output_index] * output_gates_diff[output_index];
 
 				  }
 
@@ -737,17 +1212,1036 @@ void LSTMUnitLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
 		  
 			 
 		  }
+		  top_data += top[0]->offset(1, 0);
+		  top_diff += top[0]->offset(1, 0);
+		  cell_states_map += top[0]->offset(1, 0);
+		  input_gates_map += top[0]->offset(1, 0);
+		  output_gates_map += top[0]->offset(1, 0);
+		  forget_gates_map += top[0]->offset(1, 0);
+		  net_inputs_map += top[0]->offset(1, 0);
+		  cell_states_diff += top[0]->offset(1, 0);
+		  input_gates_diff += top[0]->offset(1, 0);
+		  output_gates_diff += top[0]->offset(1, 0);
+		  forget_gates_diff += top[0]->offset(1, 0);
+		  bottom_diff += bottom[0]->offset(1, 0);
+		  bottom_data += bottom[0]->offset(1, 0);
 	  }
+	  
 	  break;
   case 2:	//top right
+	  for (int n = 0; n < top[0]->num(); ++n) {
+		  for (int oh = output_height_ - 1; oh >= 0; --oh) {
+			  for (int ow = 0; ow <output_width_; ow++){
+				  for (int hi = 0; hi < hidden_dim_; hi++)	//hid=num_output
+				  {
+					  const int output_index = oh * output_width_ + ow + hi*output_height_*output_width_ ;
+					  if (ow>0)
+						  cell_outputs_diff_x1 = top_diff[output_index - 1];
+					  else
+						  cell_outputs_diff_x1 = 0;
+					  if (oh<output_height_ - 1)
+						  cell_outputs_diff_y1 = top_diff[output_index + output_width_];
+					  else
+						  cell_outputs_diff_y1 = 0;
+					  if (ow>0)
+						  cell_states_diff_x1 = cell_states_diff[output_index - 1];
+					  else
+						  cell_states_diff_x1 = 0;
+					  if (oh<output_height_ - 1)
+						  cell_states_diff_y1 = cell_states_diff[output_index + output_width_];
+					  else
+						  cell_states_diff_y1 = 0;
+					  if (ow>0)
+						  input_gate_diff_x1 = input_gates_diff[output_index - 1];
+					  else
+						  input_gate_diff_x1 = 0;
+					  if (oh<output_height_ - 1)
+						  input_gate_diff_y1 = input_gates_diff[output_index + output_width_];
+					  else
+						  input_gate_diff_y1 = 0;
+					  if (ow>0)
+						  output_gate_diff_x1 = output_gates_diff[output_index - 1];
+					  else
+						  output_gate_diff_x1 = 0;
+					  if (oh<output_height_ - 1)
+						  output_gate_diff_y1 = output_gates_diff[output_index + output_width_];
+					  else
+						  output_gate_diff_y1 = 0;
+					  if (ow>0)
+						  forget_gate_diff_x1 = forget_gates_diff[output_index - 1];
+					  else
+						  forget_gate_diff_x1 = 0;
+					  if (oh<output_height_ - 1)
+						  forget_gate_diff_y1 = forget_gates_diff[output_index + output_width_];
+					  else
+						  forget_gate_diff_y1 = 0;
+					  if (ow>0)
+						  forget_gate_x1 = forget_gates_map[output_index - 1];
+					  else
+						  forget_gate_x1 = 0;
+					  if (oh<output_height_ - 1)
+						  forget_gate_y1 = forget_gates_map[output_index + output_width_];
+					  else
+						  forget_gate_y1 = 0;
+
+					  if (ow>0)
+						  cell_states_x1 = cell_states_map[output_index - 1];
+					  else
+						  cell_states_x1 = 0;
+					  if (oh<output_height_ - 1)
+						  cell_states_y1 = cell_states_map[output_index + output_width_];
+					  else
+						  cell_states_y1 = 0;
+					  if (ow<output_width_ - 1)
+						  cell_states_x_1 = cell_states_map[output_index + 1];
+					  else
+						  cell_states_x_1 = 0;
+					  if (oh>0)
+						  cell_states_y_1 = cell_states_map[output_index - output_width_];
+					  else
+						  cell_states_y_1 = 0;
+					  if (ow<output_width_ - 1)
+						  cell_outputs_x_1 = top_data[output_index + 1];
+					  else
+						  cell_outputs_x_1 = 0;
+					  if (oh>0)
+						  cell_outputs_y_1 = top_data[output_index - output_width_];
+					  else
+						  cell_outputs_y_1 = 0;
+					  cell_outputs_diff = top_diff[output_index];
+					  //need adding hstart
+					  const int sub_weight_offset = kernel_height_*kernel_width_;
+					  const int sub_weight_offset_h = hidden_dim_*hidden_dim_;
+
+					  const int weight_c_index = hi * 5;
+					  for (int hj = 0; hj<hidden_dim_; hj++)
+					  {
+
+						  const int weight_h_index = hi*hidden_dim_ + hj;
+
+
+						  cell_outputs_diff += weight_hhx[weight_h_index] * cell_outputs_diff_x1;
+						  cell_outputs_diff += weight_hhy[weight_h_index] * cell_outputs_diff_y1;	//Equation 8.15
+						  cell_outputs_diff += weight_hhx[weight_h_index + sub_weight_offset_h] * input_gate_diff_x1;
+						  cell_outputs_diff += weight_hhy[weight_h_index + sub_weight_offset_h] * input_gate_diff_y1;
+						  cell_outputs_diff += weight_hhx[weight_h_index + sub_weight_offset_h * 2] * output_gate_diff_x1;
+						  cell_outputs_diff += weight_hhy[weight_h_index + sub_weight_offset_h * 2] * output_gate_diff_y1;
+						  cell_outputs_diff += weight_hhx[weight_h_index + sub_weight_offset_h * 3] * forget_gate_diff_x1;
+						  cell_outputs_diff += weight_hhy[weight_h_index + sub_weight_offset_h * 3] * forget_gate_diff_y1;	//Equation 8.15
+					  }
+					  output_gates_diff[output_index] = cell_outputs_diff*tanh(cell_states_map[output_index])*dsigmoid(output_gates_map[output_index]);	//Equation 8.16
+
+					  cell_states_diff[output_index] = output_gates_map[output_index] * dtanh(top_data[output_index])*cell_outputs_diff;
+					  cell_states_diff[output_index] += weight_cg[weight_c_index] * input_gate_diff_x1;
+					  cell_states_diff[output_index] += weight_cg[weight_c_index + 1] * input_gate_diff_y1;
+
+					  cell_states_diff[output_index] += weight_cg[weight_c_index + 2] * forget_gate_diff_x1;
+					  cell_states_diff[output_index] += weight_cg[weight_c_index + 3] * forget_gate_diff_y1;
+					  cell_states_diff[output_index] += weight_cg[weight_c_index + 4] * output_gate_diff;
+					  cell_states_diff[output_index] += forget_gate_x1*cell_states_x1;
+					  cell_states_diff[output_index] += forget_gate_y1*cell_states_y1;//Equation 8.17
+					  cell_input_diff = input_gates_map[output_index] * dtanh(net_inputs_map[output_index])*cell_states_diff[output_index];	//Equation 8.18
+					  forget_gates_diff[output_index] = dsigmoid(forget_gates_map[output_index])*cell_states_diff[output_index] * (cell_states_x_1 + cell_states_y_1);	//Equation 8.19
+					  input_gates_diff[output_index] = dsigmoid(input_gates_map[output_index])*cell_states_diff[output_index] * net_inputs_map[output_index];	//Eqaaution 8.20
+
+					  int hstart = oh * stride_height_;
+					  int wstart = ow * stride_width_;
+					  int hend = min(hstart + kernel_height_, input_height_);
+					  int wend = min(wstart + kernel_width_, input_width_);
+					  hstart = max(hstart, 0);
+					  wstart = max(wstart, 0);
+					 
+					  int weight_offset = kernel_height_*kernel_width_*hi*channels_*weight_groups;
+					  for (int c = 0; c < channels_; ++c)
+					  {
+						  int weight_index = 0;
+						  for (int h = hstart; h < hend; ++h) {
+							 
+							  for (int w = wstart; w < wend; ++w) {
+								  int index = h * input_width_ + c*input_height_*input_width_ + w;
+								  dw_ih[weight_index + weight_offset] += bottom_data[index] * cell_input_diff;
+								  dw_ih[weight_index + weight_offset + sub_weight_offset] += bottom_data[index] * input_gates_diff[output_index];
+								  dw_ih[weight_index + weight_offset + sub_weight_offset * 2] += bottom_data[index] * output_gates_diff[output_index];
+								  dw_ih[weight_index + weight_offset + sub_weight_offset * 3] += bottom_data[index] * forget_gates_diff[output_index];
+								  bottom_diff[index] += weight_ih[weight_index + weight_offset] * cell_input_diff;
+								  bottom_diff[index] += weight_ih[weight_index + weight_offset + sub_weight_offset] * input_gates_diff[output_index];
+								  bottom_diff[index] += weight_ih[weight_index + weight_offset + sub_weight_offset * 2] * output_gates_diff[output_index];
+								  bottom_diff[index] += weight_ih[weight_index + weight_offset + sub_weight_offset * 3] * forget_gates_diff[output_index];
+								  weight_index++;
+							  }
+						  }
+						  weight_offset += kernel_height_*kernel_width_*weight_groups;
+					  }
+
+
+
+					  for (int hj = 0; hj < hidden_dim_; hj++)
+					  {
+						  const int weight_h_index = hj*hidden_dim_ + hi;
+						  dw_hhx[weight_h_index] += cell_input_diff*cell_outputs_x_1;
+						  dw_hhy[weight_h_index] += cell_input_diff*cell_outputs_y_1;
+
+						  dw_hhx[weight_h_index + sub_weight_offset_h] += input_gates_diff[output_index] * cell_outputs_x_1;
+						  dw_hhy[weight_h_index + sub_weight_offset_h] += input_gates_diff[output_index] * cell_outputs_y_1;
+
+						  dw_hhx[weight_h_index + sub_weight_offset_h * 2] += output_gates_diff[output_index] * cell_outputs_x_1;
+						  dw_hhy[weight_h_index + sub_weight_offset_h * 2] += output_gates_diff[output_index] * cell_outputs_y_1;
+
+						  dw_hhx[weight_h_index + sub_weight_offset_h * 3] += forget_gates_diff[output_index] * cell_outputs_x_1;
+						  dw_hhy[weight_h_index + sub_weight_offset_h * 3] += forget_gates_diff[output_index] * cell_outputs_y_1;
+
+
+					  }
+
+					  dw_cg[hi * 5] += cell_states_x_1 * input_gates_diff[output_index];
+					  dw_cg[hi * 5 + 1] += cell_states_y_1* input_gates_diff[output_index];
+					  dw_cg[hi * 5 + 2] += cell_states_x_1 * forget_gates_diff[output_index];
+					  dw_cg[hi * 5 + 3] += cell_states_y_1* forget_gates_diff[output_index];
+					  dw_cg[hi * 5 + 4] += cell_states_map[output_index] * output_gates_diff[output_index];
+
+				  }
+
+
+			  }
+
+
+		  }
+		  top_data += top[0]->offset(1, 0);
+		  top_diff += top[0]->offset(1, 0);
+		  cell_states_map += top[0]->offset(1, 0);
+		  input_gates_map += top[0]->offset(1, 0);
+		  output_gates_map += top[0]->offset(1, 0);
+		  forget_gates_map += top[0]->offset(1, 0);
+		  net_inputs_map += top[0]->offset(1, 0);
+		  cell_states_diff += top[0]->offset(1, 0);
+		  input_gates_diff += top[0]->offset(1, 0);
+		  output_gates_diff += top[0]->offset(1, 0);
+		  forget_gates_diff += top[0]->offset(1, 0);
+		  bottom_diff += bottom[0]->offset(1, 0);
+		  bottom_data += bottom[0]->offset(1, 0);
+	  }
 	  break;
   case 3:	//bottom left
+	  for (int n = 0; n < top[0]->num(); ++n) {
+		  for (int oh = 0; oh <output_height_; ++oh) {
+			  for (int ow = output_width_ - 1; ow >= 0; --ow){
+				  for (int hi = 0; hi < hidden_dim_; hi++)	//hid=num_output
+				  {
+					  const int output_index = oh * output_width_ + ow + hi*output_height_*output_width_;
+					  if (ow<output_width_ - 1)
+						  cell_outputs_diff_x1 = top_diff[output_index + 1];
+					  else
+						  cell_outputs_diff_x1 = 0;
+					  if (oh>0)
+						  cell_outputs_diff_y1 = top_diff[output_index - output_width_];
+					  else
+						  cell_outputs_diff_y1 = 0;
+					  if (ow<output_width_ - 1)
+						  cell_states_diff_x1 = cell_states_diff[output_index + 1];
+					  else
+						  cell_states_diff_x1 = 0;
+					  if (oh>0)
+						  cell_states_diff_y1 = cell_states_diff[output_index - output_width_];
+					  else
+						  cell_states_diff_y1 = 0;
+					  if (ow<output_width_ - 1)
+						  input_gate_diff_x1 = input_gates_diff[output_index + 1];
+					  else
+						  input_gate_diff_x1 = 0;
+					  if (oh>0)
+						  input_gate_diff_y1 = input_gates_diff[output_index - output_width_];
+					  else
+						  input_gate_diff_y1 = 0;
+					  if (ow>0)
+						  output_gate_diff_x1 = output_gates_diff[output_index - 1];
+					  else
+						  output_gate_diff_x1 = 0;
+					  if (oh<output_height_ - 1)
+						  output_gate_diff_y1 = output_gates_diff[output_index + output_width_];
+					  else
+						  output_gate_diff_y1 = 0;
+					  if (ow<output_width_ - 1)
+						  forget_gate_diff_x1 = forget_gates_diff[output_index + 1];
+					  else
+						  forget_gate_diff_x1 = 0;
+					  if (oh>0)
+						  forget_gate_diff_y1 = forget_gates_diff[output_index - output_width_];
+					  else
+						  forget_gate_diff_y1 = 0;
+					  if (ow<output_width_ - 1)
+						  forget_gate_x1 = forget_gates_map[output_index + 1];
+					  else
+						  forget_gate_x1 = 0;
+					  if (oh>0)
+						  forget_gate_y1 = forget_gates_map[output_index - output_width_];
+					  else
+						  forget_gate_y1 = 0;
+
+					  if (ow<output_width_ - 1)
+						  cell_states_x1 = cell_states_map[output_index + 1];
+					  else
+						  cell_states_x1 = 0;
+					  if (oh>0)
+						  cell_states_y1 = cell_states_map[output_index - output_width_];
+					  else
+						  cell_states_y1 = 0;
+					  if (ow>0)
+						  cell_states_x_1 = cell_states_map[output_index - 1];
+					  else
+						  cell_states_x_1 = 0;
+					  if (oh<output_height_ - 1)
+						  cell_states_y_1 = cell_states_map[output_index + output_width_];
+					  else
+						  cell_states_y_1 = 0;
+					  if (ow>0)
+						  cell_outputs_x_1 = top_data[output_index - 1];
+					  else
+						  cell_outputs_x_1 = 0;
+					  if (oh<output_height_ - 1)
+						  cell_outputs_y_1 = top_data[output_index + output_width_];
+					  else
+						  cell_outputs_y_1 = 0;
+					  cell_outputs_diff = top_diff[output_index];
+					  //need adding hstart
+					  const int sub_weight_offset = kernel_height_*kernel_width_;
+					  const int sub_weight_offset_h = hidden_dim_*hidden_dim_;
+
+					  const int weight_c_index = hi * 5;
+					  for (int hj = 0; hj<hidden_dim_; hj++)
+					  {
+
+						  const int weight_h_index = hi*hidden_dim_ + hj;
+
+
+						  cell_outputs_diff += weight_hhx[weight_h_index] * cell_outputs_diff_x1;
+						  cell_outputs_diff += weight_hhy[weight_h_index] * cell_outputs_diff_y1;	//Equation 8.15
+						  cell_outputs_diff += weight_hhx[weight_h_index + sub_weight_offset_h] * input_gate_diff_x1;
+						  cell_outputs_diff += weight_hhy[weight_h_index + sub_weight_offset_h] * input_gate_diff_y1;
+						  cell_outputs_diff += weight_hhx[weight_h_index + sub_weight_offset_h * 2] * output_gate_diff_x1;
+						  cell_outputs_diff += weight_hhy[weight_h_index + sub_weight_offset_h * 2] * output_gate_diff_y1;
+						  cell_outputs_diff += weight_hhx[weight_h_index + sub_weight_offset_h * 3] * forget_gate_diff_x1;
+						  cell_outputs_diff += weight_hhy[weight_h_index + sub_weight_offset_h * 3] * forget_gate_diff_y1;	//Equation 8.15
+					  }
+					  output_gates_diff[output_index] = cell_outputs_diff*tanh(cell_states_map[output_index])*dsigmoid(output_gates_map[output_index]);	//Equation 8.16
+					  cell_states_diff[output_index] = output_gates_map[output_index] * dtanh(top_data[output_index])*cell_outputs_diff;
+					  cell_states_diff[output_index] += weight_cg[weight_c_index] * input_gate_diff_x1;
+					  cell_states_diff[output_index] += weight_cg[weight_c_index + 1] * input_gate_diff_y1;
+
+					  cell_states_diff[output_index] += weight_cg[weight_c_index + 2] * forget_gate_diff_x1;
+					  cell_states_diff[output_index] += weight_cg[weight_c_index + 3] * forget_gate_diff_y1;
+					  cell_states_diff[output_index] += weight_cg[weight_c_index + 4] * output_gate_diff;
+					  cell_states_diff[output_index] += forget_gate_x1*cell_states_x1;
+					  cell_states_diff[output_index] += forget_gate_y1*cell_states_y1;//Equation 8.17
+					  cell_input_diff = input_gates_map[output_index] * dtanh(net_inputs_map[output_index])*cell_states_diff[output_index];	//Equation 8.18
+					  forget_gates_diff[output_index] = dsigmoid(forget_gates_map[output_index])*cell_states_diff[output_index] * (cell_states_x_1 + cell_states_y_1);	//Equation 8.19
+					  input_gates_diff[output_index] = dsigmoid(input_gates_map[output_index])*cell_states_diff[output_index] * net_inputs_map[output_index];	//Eqaaution 8.20
+
+					  int hstart = oh * stride_height_;
+					  int wstart = ow * stride_width_;
+					  int hend = min(hstart + kernel_height_, input_height_);
+					  int wend = min(wstart + kernel_width_, input_width_);
+					  hstart = max(hstart, 0);
+					  wstart = max(wstart, 0);
+					  
+					  int weight_offset = kernel_height_*kernel_width_*hi*channels_*weight_groups;
+					  for (int c = 0; c < channels_; ++c)
+					  {
+						  int weight_index = 0;
+						  for (int h = hstart; h < hend; ++h) {
+							  for (int w = wstart; w < wend; ++w) {
+								  int index = h * input_width_ + c*input_height_*input_width_ + w;
+								  dw_ih[weight_index + weight_offset] += bottom_data[index] * cell_input_diff;
+								  dw_ih[weight_index + weight_offset + sub_weight_offset] += bottom_data[index] * input_gates_diff[output_index];
+								  dw_ih[weight_index + weight_offset + sub_weight_offset * 2] += bottom_data[index] * output_gates_diff[output_index];
+								  dw_ih[weight_index + weight_offset + sub_weight_offset * 3] += bottom_data[index] * forget_gates_diff[output_index];
+								  bottom_diff[index] += weight_ih[weight_index + weight_offset] * cell_input_diff;
+								  bottom_diff[index] += weight_ih[weight_index + weight_offset + sub_weight_offset] * input_gates_diff[output_index];
+								  bottom_diff[index] += weight_ih[weight_index + weight_offset + sub_weight_offset * 2] * output_gates_diff[output_index];
+								  bottom_diff[index] += weight_ih[weight_index + weight_offset + sub_weight_offset * 3] * forget_gates_diff[output_index];
+								  weight_index++;
+							  }
+						  }
+						  weight_offset += kernel_height_*kernel_width_*weight_groups;
+					  }
+
+
+
+					  for (int hj = 0; hj < hidden_dim_; hj++)
+					  {
+						  const int weight_h_index = hj*hidden_dim_ + hi;
+						  dw_hhx[weight_h_index] += cell_input_diff*cell_outputs_x_1;
+						  dw_hhy[weight_h_index] += cell_input_diff*cell_outputs_y_1;
+
+						  dw_hhx[weight_h_index + sub_weight_offset_h] += input_gates_diff[output_index] * cell_outputs_x_1;
+						  dw_hhy[weight_h_index + sub_weight_offset_h] += input_gates_diff[output_index] * cell_outputs_y_1;
+
+						  dw_hhx[weight_h_index + sub_weight_offset_h * 2] += output_gates_diff[output_index] * cell_outputs_x_1;
+						  dw_hhy[weight_h_index + sub_weight_offset_h * 2] += output_gates_diff[output_index] * cell_outputs_y_1;
+
+						  dw_hhx[weight_h_index + sub_weight_offset_h * 3] += forget_gates_diff[output_index] * cell_outputs_x_1;
+						  dw_hhy[weight_h_index + sub_weight_offset_h * 3] += forget_gates_diff[output_index] * cell_outputs_y_1;
+
+
+					  }
+					  dw_cg[hi * 5] += cell_states_x_1 * input_gates_diff[output_index];
+					  dw_cg[hi * 5 + 1] += cell_states_y_1* input_gates_diff[output_index];
+					  dw_cg[hi * 5 + 2] += cell_states_x_1 * forget_gates_diff[output_index];
+					  dw_cg[hi * 5 + 3] += cell_states_y_1* forget_gates_diff[output_index];
+					  dw_cg[hi * 5 + 4] += cell_states_map[output_index] * output_gates_diff[output_index];
+
+				  }
+
+
+			  }
+
+
+		  }
+		  top_data += top[0]->offset(1, 0);
+		  top_diff += top[0]->offset(1, 0);
+		  cell_states_map += top[0]->offset(1, 0);
+		  input_gates_map += top[0]->offset(1, 0);
+		  output_gates_map += top[0]->offset(1, 0);
+		  forget_gates_map += top[0]->offset(1, 0);
+		  net_inputs_map += top[0]->offset(1, 0);
+		  cell_states_diff += top[0]->offset(1, 0);
+		  input_gates_diff += top[0]->offset(1, 0);
+		  output_gates_diff += top[0]->offset(1, 0);
+		  forget_gates_diff += top[0]->offset(1, 0);
+		  bottom_diff += bottom[0]->offset(1, 0);
+		  bottom_data += bottom[0]->offset(1, 0);
+	  }
 	  break;
   case 4:	//bottom right
+	  FILE* fp1;
+	  for (int n = 0; n < top[0]->num(); ++n) {
+		  tempchar[0] = '\0';
+		  sprintf(tempchar, "top_diff%d.txt", n);
+		  fopen_s(&fp1, tempchar, "w");
+		  int tempcount = 0;
+		  for (int i = 0; i < output_height_; i++)
+		  {
+			  for (int j = 0; j < output_width_; j++)
+			  {
+				  fprintf(fp1, "%f\t", top_diff[tempcount]);
+				  tempcount++;
+			  }
+			  fprintf(fp1, "\n");
+		  }
+		  fclose(fp1);
+		  for (int oh = 0; oh <output_height_; ++oh) {
+			  for (int ow = 0; ow <output_width_; ++ow){
+				  for (int hi = 0; hi < hidden_dim_; hi++)	//hid=num_output
+				  {
+					  const int output_index = oh * output_width_ + ow + hi*output_height_*output_width_ ;
+					  if (ow>0)
+						  cell_outputs_diff_x1 = top_diff[output_index - 1];
+					  else
+						  cell_outputs_diff_x1 = 0;
+					  if (oh>0)
+						  cell_outputs_diff_y1 = top_diff[output_index - output_width_];
+					  else
+						  cell_outputs_diff_y1 = 0;
+					  if (ow>0)
+						  cell_states_diff_x1 = cell_states_diff[output_index - 1];
+					  else
+						  cell_states_diff_x1 = 0;
+					  if (oh>0)
+						  cell_states_diff_y1 = cell_states_diff[output_index - output_width_];
+					  else
+						  cell_states_diff_y1 = 0;
+					  if (ow>0)
+						  input_gate_diff_x1 = input_gates_diff[output_index - 1];
+					  else
+						  input_gate_diff_x1 = 0;
+					  if (oh>0)
+						  input_gate_diff_y1 = input_gates_diff[output_index - output_width_];
+					  else
+						  input_gate_diff_y1 = 0;
+					  if (ow>0)
+						  output_gate_diff_x1 = output_gates_diff[output_index - 1];
+					  else
+						  output_gate_diff_x1 = 0;
+					  if (oh<output_height_ - 1)
+						  output_gate_diff_y1 = output_gates_diff[output_index + output_width_];
+					  else
+						  output_gate_diff_y1 = 0;
+					  if (ow>0)
+						  forget_gate_diff_x1 = forget_gates_diff[output_index - 1];
+					  else
+						  forget_gate_diff_x1 = 0;
+					  if (oh>0)
+						  forget_gate_diff_y1 = forget_gates_diff[output_index - output_width_];
+					  else
+						  forget_gate_diff_y1 = 0;
+					  if (ow>0)
+						  forget_gate_x1 = forget_gates_map[output_index - 1];
+					  else
+						  forget_gate_x1 = 0;
+					  if (oh>0)
+						  forget_gate_y1 = forget_gates_map[output_index - output_width_];
+					  else
+						  forget_gate_y1 = 0;
+
+					  if (ow>0)
+						  cell_states_x1 = cell_states_map[output_index - 1];
+					  else
+						  cell_states_x1 = 0;
+					  if (oh>0)
+						  cell_states_y1 = cell_states_map[output_index - output_width_];
+					  else
+						  cell_states_y1 = 0;
+					  if (ow < output_width_ - 1)
+						  cell_states_x_1 = cell_states_map[output_index + 1];
+					  else
+						  cell_states_x_1 = 0;
+					  if (oh<output_height_ - 1)
+						  cell_states_y_1 = cell_states_map[output_index + output_width_];
+					  else
+						  cell_states_y_1 = 0;
+					  if (ow<output_width_ - 1)
+						  cell_outputs_x_1 = top_data[output_index + 1];
+					  else
+						  cell_outputs_x_1 = 0;
+					  if (oh<output_height_ - 1)
+						  cell_outputs_y_1 = top_data[output_index + output_width_];
+					  else
+						  cell_outputs_y_1 = 0;
+					  cell_outputs_diff = top_diff[output_index];
+					  if (abs(cell_outputs_diff)>0.1)
+						  int tempint0 = 0;
+					  //need adding hstart
+					  const int sub_weight_offset = kernel_height_*kernel_width_;
+					  const int sub_weight_offset_h = hidden_dim_*hidden_dim_;
+
+					  const int weight_c_index = hi * 5;
+					  for (int hj = 0; hj<hidden_dim_; hj++)
+					  {
+
+						  const int weight_h_index = hi*hidden_dim_ + hj;
+
+
+						  cell_outputs_diff += weight_hhx[weight_h_index] * cell_outputs_diff_x1;
+						  cell_outputs_diff += weight_hhy[weight_h_index] * cell_outputs_diff_y1;	//Equation 8.15
+						  cell_outputs_diff += weight_hhx[weight_h_index + sub_weight_offset_h] * input_gate_diff_x1;
+						  cell_outputs_diff += weight_hhy[weight_h_index + sub_weight_offset_h] * input_gate_diff_y1;
+						  cell_outputs_diff += weight_hhx[weight_h_index + sub_weight_offset_h * 2] * output_gate_diff_x1;
+						  cell_outputs_diff += weight_hhy[weight_h_index + sub_weight_offset_h * 2] * output_gate_diff_y1;
+						  cell_outputs_diff += weight_hhx[weight_h_index + sub_weight_offset_h * 3] * forget_gate_diff_x1;
+						  cell_outputs_diff += weight_hhy[weight_h_index + sub_weight_offset_h * 3] * forget_gate_diff_y1;	//Equation 8.15
+						  if (cell_outputs_diff>0.0001)
+							  int tempint0 = 0;
+					  }
+					  output_gates_diff[output_index] = cell_outputs_diff*tanh(cell_states_map[output_index])*dsigmoid(output_gates_map[output_index]);	//Equation 8.16
+
+					  cell_states_diff[output_index] = output_gates_map[output_index] * dtanh(top_data[output_index])*cell_outputs_diff;
+					  cell_states_diff[output_index] += weight_cg[weight_c_index] * input_gate_diff_x1;
+					  cell_states_diff[output_index] += weight_cg[weight_c_index + 1] * input_gate_diff_y1;
+					  cell_states_diff[output_index] += weight_cg[weight_c_index + 2] * forget_gate_diff_x1;
+					  cell_states_diff[output_index] += weight_cg[weight_c_index + 3] * forget_gate_diff_y1;
+					  cell_states_diff[output_index] += weight_cg[weight_c_index + 4] * output_gate_diff;
+					  cell_states_diff[output_index] += forget_gate_x1*cell_states_x1;
+					  cell_states_diff[output_index] += forget_gate_y1*cell_states_y1;//Equation 8.17
+					  if (cell_outputs_diff>0.0001)
+						  int tempint0 = 0;
+					  cell_input_diff = input_gates_map[output_index] * dtanh(net_inputs_map[output_index])*cell_states_diff[output_index];	//Equation 8.18
+					  if (cell_input_diff > 100)
+					  {
+						  float tempfloat = input_gates_map[output_index];
+						  tempfloat = net_inputs_map[output_index];
+						  tempfloat = cell_states_diff[output_index];
+					  }
+					  forget_gates_diff[output_index] = dsigmoid(forget_gates_map[output_index])*cell_states_diff[output_index] * (cell_states_x_1 + cell_states_y_1);	//Equation 8.19
+					  if (forget_gates_diff[output_index]>100)
+						  int tempint0 = 0;
+					  input_gates_diff[output_index] = dsigmoid(input_gates_map[output_index])*cell_states_diff[output_index] * net_inputs_map[output_index];	//Eqaaution 8.20
+
+					  int hstart = oh * stride_height_;
+					  int wstart = ow * stride_width_;
+					  int hend = min(hstart + kernel_height_, input_height_);
+					  int wend = min(wstart + kernel_width_, input_width_);
+					  hstart = max(hstart, 0);
+					  wstart = max(wstart, 0);
+					  
+					  int weight_offset = kernel_height_*kernel_width_*hi*channels_*weight_groups;
+					  for (int c = 0; c < channels_; ++c)
+					  {
+						  int weight_index = 0;
+						  for (int h = hstart; h < hend; ++h) {
+							  for (int w = wstart; w < wend; ++w) {
+								  int index = h * input_width_ + c*input_height_*input_width_ + w;
+								  dw_ih[weight_index + weight_offset] += bottom_data[index] * cell_input_diff;
+								  dw_ih[weight_index + weight_offset + sub_weight_offset] += bottom_data[index] * input_gates_diff[output_index];
+								  dw_ih[weight_index + weight_offset + sub_weight_offset * 2] += bottom_data[index] * output_gates_diff[output_index];
+								  dw_ih[weight_index + weight_offset + sub_weight_offset * 3] += bottom_data[index] * forget_gates_diff[output_index];
+								  bottom_diff[index] += weight_ih[weight_index + weight_offset] * cell_input_diff;
+								  bottom_diff[index] += weight_ih[weight_index + weight_offset + sub_weight_offset] * input_gates_diff[output_index];
+								  bottom_diff[index] += weight_ih[weight_index + weight_offset + sub_weight_offset * 2] * output_gates_diff[output_index];
+								  bottom_diff[index] += weight_ih[weight_index + weight_offset + sub_weight_offset * 3] * forget_gates_diff[output_index];
+								  weight_index++;
+							  }
+						  }
+						  weight_offset += kernel_height_*kernel_width_*weight_groups;
+					  }
+
+
+
+					  for (int hj = 0; hj < hidden_dim_; hj++)
+					  {
+						  const int weight_h_index = hj*hidden_dim_ + hi;
+						  dw_hhx[weight_h_index] += cell_input_diff*cell_outputs_x_1;
+						  dw_hhy[weight_h_index] += cell_input_diff*cell_outputs_y_1;
+
+						  dw_hhx[weight_h_index + sub_weight_offset_h] += input_gates_diff[output_index] * cell_outputs_x_1;
+						  dw_hhy[weight_h_index + sub_weight_offset_h] += input_gates_diff[output_index] * cell_outputs_y_1;
+
+						  dw_hhx[weight_h_index + sub_weight_offset_h * 2] += output_gates_diff[output_index] * cell_outputs_x_1;
+						  dw_hhy[weight_h_index + sub_weight_offset_h * 2] += output_gates_diff[output_index] * cell_outputs_y_1;
+
+						  dw_hhx[weight_h_index + sub_weight_offset_h * 3] += forget_gates_diff[output_index] * cell_outputs_x_1;
+						  dw_hhy[weight_h_index + sub_weight_offset_h * 3] += forget_gates_diff[output_index] * cell_outputs_y_1;
+
+
+					  }
+
+					  dw_cg[hi * 5] += cell_states_x_1 * input_gates_diff[output_index];
+					  dw_cg[hi * 5 + 1] += cell_states_y_1* input_gates_diff[output_index];
+					  dw_cg[hi * 5 + 2] += cell_states_x_1 * forget_gates_diff[output_index];
+					  dw_cg[hi * 5 + 3] += cell_states_y_1* forget_gates_diff[output_index];
+					  dw_cg[hi * 5 + 4] += cell_states_map[output_index] * output_gates_diff[output_index];
+
+				  }
+
+
+			  }
+
+
+		  }
+		  top_data += top[0]->offset(1, 0);
+		  top_diff += top[0]->offset(1, 0);
+		  cell_states_map += top[0]->offset(1, 0);
+		  input_gates_map += top[0]->offset(1, 0);
+		  output_gates_map += top[0]->offset(1, 0);
+		  forget_gates_map += top[0]->offset(1, 0);
+		  net_inputs_map += top[0]->offset(1, 0);
+		  cell_states_diff += top[0]->offset(1, 0);
+		  input_gates_diff += top[0]->offset(1, 0);
+		  output_gates_diff += top[0]->offset(1, 0);
+		  forget_gates_diff += top[0]->offset(1, 0);
+		  bottom_diff += bottom[0]->offset(1, 0);
+		  bottom_data += bottom[0]->offset(1, 0);
+	  }
+	 
+	  
 	  break;
 
   }
 
+  top_data -= top[0]->offset(top[0]->num(), 0);
+  bottom_data -= bottom[0]->offset(bottom[0]->num(), 0);
+  top_diff -= top[0]->offset(top[0]->num(), 0);
+  cell_states_map -= top[0]->offset(top[0]->num(), 0);
+  input_gates_map -= top[0]->offset(top[0]->num(), 0);
+  output_gates_map -= top[0]->offset(top[0]->num(), 0);
+  forget_gates_map -= top[0]->offset(top[0]->num(), 0);
+  net_inputs_map -= top[0]->offset(top[0]->num(), 0);
+  cell_states_diff -= top[0]->offset(top[0]->num(), 0);
+  input_gates_diff -= top[0]->offset(top[0]->num(), 0);
+  output_gates_diff -= top[0]->offset(top[0]->num(), 0);
+  forget_gates_diff -= top[0]->offset(top[0]->num(), 0);
+  bottom_diff -= bottom[0]->offset(bottom[0]->num(), 0);
+  int weight_index = 0;
+  const int output_size = output_width_*output_height_*top[0]->num();
+  const int sub_weight_offset = kernel_height_*kernel_width_;
+  const int sub_weight_offset_h = hidden_dim_*hidden_dim_;
+  for (int hi = 0; hi < hidden_dim_; hi++)
+  {
+	  int weight_offset = channels_*kernel_height_*kernel_width_*hi*weight_groups;
+	  for (int c = 0; c < channels_; ++c)
+	  {
+		  weight_index = 0;
+		  for (int h = 0; h < kernel_height_; ++h) {
+			  for (int w = 0; w < kernel_width_; ++w) {
+				  dw_ih[weight_index + weight_offset] /= output_size;
+				  dw_ih[weight_index + weight_offset + sub_weight_offset] /= output_size;
+				  dw_ih[weight_index + weight_offset + sub_weight_offset * 2] /= output_size;
+				  dw_ih[weight_index + weight_offset + sub_weight_offset * 3] /= output_size;
+				  weight_index++;
+			  }
+		  }
+		  weight_offset += kernel_height_*kernel_width_*weight_groups;
+	  }
+	 
+  }
+
+  for (int hi = 0; hi < hidden_dim_; hi++)
+  {
+	  for (int hj = 0; hj<hidden_dim_; hj++)
+	  {
+		  const int weight_h_index = hi*hidden_dim_ + hj;
+		  dw_hhx[weight_h_index] /= output_size;
+		  dw_hhx[weight_h_index + sub_weight_offset_h] /= output_size;
+		  dw_hhx[weight_h_index + sub_weight_offset_h * 2] /= output_size;
+		  dw_hhx[weight_h_index + sub_weight_offset_h * 3] /= output_size;
+		  dw_hhy[weight_h_index] /= output_size;
+		  dw_hhy[weight_h_index + sub_weight_offset_h] /= output_size;
+		  dw_hhy[weight_h_index + sub_weight_offset_h * 2] /= output_size;
+		  dw_hhy[weight_h_index + sub_weight_offset_h * 3] /= output_size;
+	  }
+  }
+  for (int hi = 0; hi < hidden_dim_; hi++)
+  {
+	  for (int hj = 0; hj<5; hj++)
+	  {
+		  const int weight_h_index = hi*hidden_dim_ + hj;
+		  dw_cg[weight_h_index] /= output_size;
+	  }
+  }
+  //FILE* fp;
+  //fopen_s(&fp, "weight_ih.txt", "w");
+
+  //for (int hi = 0; hi < hidden_dim_; hi++)
+  //{
+	 // int weight_offset = channels_*kernel_height_*kernel_width_*hi*weight_groups;
+	 // for (int c = 0; c < channels_; ++c)
+	 // {
+		//  weight_index = 0;
+		//  for (int h = 0; h < kernel_height_; ++h) {
+		//	  for (int w = 0; w < kernel_width_; ++w) {
+		//		  fprintf(fp, "%f\t", weight_ih[weight_index + weight_offset]);
+		//		  weight_index++;
+		//	  }
+		//	  fprintf(fp, "\n");
+		//  }
+		//  weight_offset += kernel_height_*kernel_width_*weight_groups;
+	 // }
+	 // fprintf(fp, "\n");
+	 // weight_offset = channels_*kernel_height_*kernel_width_*hi*weight_groups;
+	 // for (int c = 0; c < channels_; ++c)
+	 // {
+		//  weight_index = 0;
+		//  for (int h = 0; h < kernel_height_; ++h) {
+		//	  for (int w = 0; w < kernel_width_; ++w) {
+		//		  fprintf(fp, "%f\t", weight_ih[weight_index + weight_offset + sub_weight_offset]);
+		//		  weight_index++;
+		//	  }
+		//	  fprintf(fp, "\n");
+		//  }
+		//  weight_offset += kernel_height_*kernel_width_*weight_groups;
+	 // }
+	 // fprintf(fp, "\n");
+	 // weight_offset = channels_*kernel_height_*kernel_width_*hi*weight_groups;
+	 // for (int c = 0; c < channels_; ++c)
+	 // {
+		//  weight_index = 0;
+		//  for (int h = 0; h < kernel_height_; ++h) {
+		//	  int index = h * kernel_width_;
+		//	  for (int w = 0; w < kernel_width_; ++w) {
+		//		  index += w;
+		//		  fprintf(fp, "%f\t", weight_ih[weight_index + weight_offset + sub_weight_offset * 2]);
+		//		  weight_index++;
+		//	  }
+		//	  fprintf(fp, "\n");
+		//  }
+		//  weight_offset += kernel_height_*kernel_width_*weight_groups;
+	 // }
+	 // fprintf(fp, "\n");
+	 // weight_offset = channels_*kernel_height_*kernel_width_*hi*weight_groups;
+	 // for (int c = 0; c < channels_; ++c)
+	 // {
+		//  weight_index = 0;
+		//  for (int h = 0; h < kernel_height_; ++h) {
+		//	  for (int w = 0; w < kernel_width_; ++w) {
+		//		  fprintf(fp, "%f\t", weight_ih[weight_index + weight_offset + sub_weight_offset * 3]);
+		//		  weight_index++;
+		//	  }
+		//	  fprintf(fp, "\n");
+		//  }
+		//  weight_offset += kernel_height_*kernel_width_*weight_groups;
+	 // }
+  //}
+
+  //fclose(fp);
+  //fopen_s(&fp, "weight_hhx.txt", "w");
+
+  //for (int hi = 0; hi < hidden_dim_; hi++)
+  //{
+	 // for (int hj = 0; hj<hidden_dim_; hj++)
+	 // {
+		//  const int weight_h_index = hi*hidden_dim_ + hj;
+		//  fprintf(fp, "%f\t", weight_hhx[weight_h_index]);
+	 // }
+	 // fprintf(fp, "\n");
+  //}
+  //for (int hi = 0; hi < hidden_dim_; hi++)
+  //{
+	 // for (int hj = 0; hj<hidden_dim_; hj++)
+	 // {
+		//  const int weight_h_index = hi*hidden_dim_ + hj;
+		//  fprintf(fp, "%f\t", weight_hhx[weight_h_index + sub_weight_offset_h]);
+	 // }
+	 // fprintf(fp, "\n");
+  //}
+  //for (int hi = 0; hi < hidden_dim_; hi++)
+  //{
+	 // for (int hj = 0; hj<hidden_dim_; hj++)
+	 // {
+		//  const int weight_h_index = hi*hidden_dim_ + hj;
+		//  fprintf(fp, "%f\t", weight_hhx[weight_h_index + sub_weight_offset_h * 2]);
+	 // }
+	 // fprintf(fp, "\n");
+  //}
+  //for (int hi = 0; hi < hidden_dim_; hi++)
+  //{
+	 // for (int hj = 0; hj<hidden_dim_; hj++)
+	 // {
+		//  const int weight_h_index = hi*hidden_dim_ + hj;
+		//  fprintf(fp, "%f\t", weight_hhx[weight_h_index + sub_weight_offset_h * 3]);
+	 // }
+	 // fprintf(fp, "\n");
+  //}
+  //fclose(fp);
+  //fopen_s(&fp, "weight_hhy.txt", "w");
+  //for (int hi = 0; hi < hidden_dim_; hi++)
+  //{
+	 // for (int hj = 0; hj<hidden_dim_; hj++)
+	 // {
+		//  const int weight_h_index = hi*hidden_dim_ + hj;
+		//  fprintf(fp, "%f\t", weight_hhy[weight_h_index]);
+	 // }
+	 // fprintf(fp, "\n");
+  //}
+  //for (int hi = 0; hi < hidden_dim_; hi++)
+  //{
+	 // for (int hj = 0; hj<hidden_dim_; hj++)
+	 // {
+		//  const int weight_h_index = hi*hidden_dim_ + hj;
+		//  fprintf(fp, "%f\t", weight_hhy[weight_h_index + sub_weight_offset_h]);
+	 // }
+	 // fprintf(fp, "\n");
+  //}
+  //for (int hi = 0; hi < hidden_dim_; hi++)
+  //{
+	 // for (int hj = 0; hj<hidden_dim_; hj++)
+	 // {
+		//  const int weight_h_index = hi*hidden_dim_ + hj;
+		//  fprintf(fp, "%f\t", weight_hhy[weight_h_index + sub_weight_offset_h * 2]);
+	 // }
+	 // fprintf(fp, "\n");
+  //}
+  //for (int hi = 0; hi < hidden_dim_; hi++)
+  //{
+	 // for (int hj = 0; hj<hidden_dim_; hj++)
+	 // {
+		//  const int weight_h_index = hi*hidden_dim_ + hj;
+		//  fprintf(fp, "%f\t", weight_hhy[weight_h_index + sub_weight_offset_h * 3]);
+	 // }
+	 // fprintf(fp, "\n");
+  //}
+
+  //fclose(fp);
+  //fopen_s(&fp, "weight_cg.txt", "w");
+  //for (int hi = 0; hi < hidden_dim_; hi++)
+  //{
+	 // for (int hj = 0; hj<5; hj++)
+	 // {
+		//  const int weight_h_index = hi*hidden_dim_ + hj;
+		//  fprintf(fp, "%f\t", weight_cg[weight_h_index]);
+	 // }
+	 // fprintf(fp, "\n");
+  //}
+  //fclose(fp);
+
+  //for (int n = 0; n < bottom[0]->num(); n++)
+  //{
+	 // tempchar[0] = '\0';
+	 // sprintf(tempchar, "cell_states_map%d.txt", n);
+	 // fopen_s(&fp, tempchar, "w");
+	 // for (int h = 0; h < hidden_dim_; h++)
+	 // for (int i = 0; i < output_height_; i++)
+	 // {
+		//  for (int j = 0; j < output_width_; j++)
+		//  {
+		//	  fprintf(fp, "%f\t", *cell_states_map);
+		//	  cell_states_map++;
+		//  }
+		//  fprintf(fp, "\n");
+	 // }
+	 // fclose(fp);
+	 // tempchar[0] = '\0';
+	 // sprintf(tempchar, "input_gates_map%d.txt", n);
+	 // fopen_s(&fp, tempchar, "w");
+	 // for (int h = 0; h < hidden_dim_; h++)
+	 // for (int i = 0; i < output_height_; i++)
+	 // {
+		//  for (int j = 0; j < output_width_; j++)
+		//  {
+		//	  fprintf(fp, "%f\t", *input_gates_map);
+		//	  input_gates_map++;
+		//  }
+		//  fprintf(fp, "\n");
+	 // }
+	 // fclose(fp);
+	 // tempchar[0] = '\0';
+	 // sprintf(tempchar, "output_gates_map%d.txt", n);
+	 // fopen_s(&fp, tempchar, "w");
+	 // for (int h = 0; h < hidden_dim_; h++)
+	 // for (int i = 0; i < output_height_; i++)
+	 // {
+		//  for (int j = 0; j < output_width_; j++)
+		//  {
+		//	  fprintf(fp, "%f\t", *output_gates_map);
+		//	  output_gates_map++;
+		//  }
+		//  fprintf(fp, "\n");
+	 // }
+	 // fclose(fp);
+	 // tempchar[0] = '\0';
+	 // sprintf(tempchar, "forget_gates_map%d.txt", n);
+	 // fopen_s(&fp, tempchar, "w");
+	 // for (int h = 0; h < hidden_dim_; h++)
+	 // for (int i = 0; i < output_height_; i++)
+	 // {
+		//  for (int j = 0; j < output_width_; j++)
+		//  {
+		//	  fprintf(fp, "%f\t", *forget_gates_map);
+		//	  forget_gates_map++;
+		//  }
+		//  fprintf(fp, "\n");
+	 // }
+	 // fclose(fp);
+	 // tempchar[0] = '\0';
+	 // sprintf(tempchar, "cell_states_diff%d.txt", n);
+	 // fopen_s(&fp, tempchar, "w");
+	 // for (int h = 0; h < hidden_dim_; h++)
+	 // for (int i = 0; i < output_height_; i++)
+	 // {
+		//  for (int j = 0; j < output_width_; j++)
+		//  {
+		//	  fprintf(fp, "%f\t", *cell_states_diff);
+		//	  cell_states_diff++;
+		//  }
+		//  fprintf(fp, "\n");
+	 // }
+	 // fclose(fp);
+	 // tempchar[0] = '\0';
+	 // sprintf(tempchar, "input_gates_diff%d.txt", n);
+	 // fopen_s(&fp, tempchar, "w");
+	 // for (int h = 0; h < hidden_dim_; h++)
+	 // for (int i = 0; i < output_height_; i++)
+	 // {
+		//  for (int j = 0; j < output_width_; j++)
+		//  {
+		//	  fprintf(fp, "%f\t", *input_gates_diff);
+		//	  input_gates_diff++;
+		//  }
+		//  fprintf(fp, "\n");
+	 // }
+	 // fclose(fp);
+	 // tempchar[0] = '\0';
+	 // sprintf(tempchar, "output_gates_diff%d.txt", n);
+	 // fopen_s(&fp, tempchar, "w");
+	 // for (int h = 0; h < hidden_dim_; h++)
+	 // for (int i = 0; i < output_height_; i++)
+	 // {
+		//  for (int j = 0; j < output_width_; j++)
+		//  {
+		//	  fprintf(fp, "%f\t", *output_gates_diff);
+		//	  output_gates_diff++;
+		//  }
+		//  fprintf(fp, "\n");
+	 // }
+	 // fclose(fp);
+	 // tempchar[0] = '\0';
+	 // sprintf(tempchar, "forget_gates_diff%d.txt", n);
+	 // fopen_s(&fp, tempchar, "w");
+	 // for (int h = 0; h < hidden_dim_; h++)
+	 // for (int i = 0; i < output_height_; i++)
+	 // {
+		//  for (int j = 0; j < output_width_; j++)
+		//  {
+		//	  fprintf(fp, "%f\t", *forget_gates_diff);
+		//	  forget_gates_diff++;
+		//  }
+		//  fprintf(fp, "\n");
+	 // }
+	 // fclose(fp);
+	 // tempchar[0] = '\0';
+	 // sprintf(tempchar, "top_diff%d.txt", n);
+	 // fopen_s(&fp, tempchar, "w");
+	 // for (int h = 0; h < hidden_dim_; h++)
+	 // for (int i = 0; i < output_height_; i++)
+	 // {
+		//  for (int j = 0; j < output_width_; j++)
+		//  {
+		//	  fprintf(fp, "%f\t", *top_diff);
+		//	  top_diff++;
+		//  }
+		//  fprintf(fp, "\n");
+	 // }
+	 // fclose(fp);
+	 // tempchar[0] = '\0';
+	 // sprintf(tempchar, "top_data%d.txt", n);
+	 // fopen_s(&fp, tempchar, "w");
+	 // for (int h = 0; h < hidden_dim_; h++)
+	 // {
+		//  for (int i = 0; i < output_height_; i++)
+		//  {
+		//	  for (int j = 0; j < output_width_; j++)
+		//	  {
+		//		  fprintf(fp, "%f\t", *top_data);
+		//		  top_data++;
+		//	  }
+		//	  fprintf(fp, "\n");
+		//  }
+	 // }
+	 // fclose(fp);
+	 // tempchar[0] = '\0';
+	 // sprintf(tempchar, "bottom_data%d.txt", n);
+	 // fopen_s(&fp, tempchar, "w");
+	 // for (int c = 0; c < channels_; c++)
+	 // {
+		//  for (int i = 0; i < input_height_; i++)
+		//  {
+		//	  for (int j = 0; j < input_width_; j++)
+		//	  {
+		//		  fprintf(fp, "%f\t", *bottom_data);
+		//		  bottom_data++;
+		//	  }
+		//	  fprintf(fp, "\n");
+		//  }
+	 // }
+	 // fclose(fp);
+	 // tempchar[0] = '\0';
+	 // sprintf(tempchar, "net_inputs_map%d.txt", n);
+	 // fopen_s(&fp, tempchar, "w");
+	 // for (int h = 0; h < hidden_dim_;h++)
+	 // for (int i = 0; i < output_height_; i++)
+	 // {
+		//  for (int j = 0; j < output_width_; j++)
+		//  {
+		//	  fprintf(fp, "%f\t", *net_inputs_map);
+		//	  net_inputs_map++;
+		//  }
+		//  fprintf(fp, "\n");
+	 // }
+	 // fclose(fp);
+	 // 
+  //}
+  top_data -= top[0]->offset(top[0]->num(), 0);
+  bottom_data -= bottom[0]->offset(bottom[0]->num(), 0);
+  top_diff -= top[0]->offset(top[0]->num(), 0);
+  cell_states_map -= top[0]->offset(top[0]->num(), 0);
+  input_gates_map -= top[0]->offset(top[0]->num(), 0);
+  output_gates_map -= top[0]->offset(top[0]->num(), 0);
+  forget_gates_map -= top[0]->offset(top[0]->num(), 0);
+  net_inputs_map -= top[0]->offset(top[0]->num(), 0);
+  cell_states_diff -= top[0]->offset(top[0]->num(), 0);
+  input_gates_diff -= top[0]->offset(top[0]->num(), 0);
+  output_gates_diff -= top[0]->offset(top[0]->num(), 0);
+  forget_gates_diff -= top[0]->offset(top[0]->num(), 0);
+  bottom_diff -= bottom[0]->offset(bottom[0]->num(), 0);
+  //bottom_data -= bottom[0]->offset(bottom[0]->num(), 0);
+  //top_data -= top[0]->offset(top[0]->num(), 0);
   //const int num = bottom[0]->shape(1);
   //const int x_dim = hidden_dim_ * 4;
   //const Dtype* C_prev = bottom[0]->cpu_data();

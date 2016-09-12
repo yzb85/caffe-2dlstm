@@ -169,6 +169,8 @@ class LSTMUnitLayer : public Layer<Dtype> {
   int weight_groups;
   int channels_;
   int direction;
+  Blob<Dtype> X_acts_;	//To be deleted
+  char tempchar[100];
 };
 
 }  // namespace caffe
